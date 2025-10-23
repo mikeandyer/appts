@@ -2,6 +2,7 @@ import { Pool, PoolClient } from 'pg';
 import { createPool, Pool as MysqlPool } from 'mysql2/promise';
 import type { RowDataPacket } from 'mysql2/promise';
 import { load } from 'cheerio';
+import type { AnyNode, Element, CheerioAPI } from 'cheerio';
 import OpenAI from 'openai';
 import { toAiBrief } from './types.js';
 import type { AiBrief, TemplateSlug } from './types.js';
@@ -234,9 +235,19 @@ function fallbackPage(): PagePayload[] {
   ];
 }
 
+function slugify(text: string): string {
+  return text
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 200);
+}
+
 function findAllTextNodes(html: string): string[] {
   if (!html.trim()) return [];
-  const $ = load(html);
+  const $ = load(html, { decodeEntities: false });
   const texts: string[] = [];
   $('*')
     .contents()
@@ -261,9 +272,61 @@ function findAllTextNodes(html: string): string[] {
   return texts;
 }
 
+function serializeNode($: CheerioAPI, node: AnyNode, depth = 0): string {
+  if (depth > 50) return ''; // safety guard against deep recursion
+  if (node.type === 'text') {
+    return node.data ?? '';
+  }
+  if (node.type === 'comment') {
+    return `<!--${node.data ?? ''}-->`;
+  }
+  if (node.type === 'tag') {
+    const el = node as Element;
+    const tagName = el.name.toLowerCase();
+    if (tagName === 'html' || tagName === 'body' || tagName === 'head') {
+      const chunks: string[] = [];
+      $(node)
+        .contents()
+        .each((_, child) => {
+          chunks.push(serializeNode($, child, depth + 1));
+        });
+      return chunks.join('');
+    }
+    return $.html(node) ?? '';
+  }
+  return '';
+}
+
+function serializeFragment($: CheerioAPI): string {
+  const pieces: string[] = [];
+  $.root()
+    .contents()
+    .each((_, node) => {
+      pieces.push(serializeNode($, node));
+    });
+  return normalizeStackableAttributes(pieces.join(''));
+}
+
+function normalizeStackableAttributes(html: string): string {
+  return html.replace(
+    /(<!--\s*wp:stackable\/([a-z0-9-]+)\s+)(\{[\s\S]*?\})(\s*-->)/gi,
+    (match, prefix, blockName, jsonPart, suffix) => {
+      let fixedJson = jsonPart;
+      if (blockName === 'video-popup') {
+        fixedJson = fixedJson.replace(
+          /("blockHeight"\s*:\s*)(-?\d+(?:\.\d+)?)(?=[,\}])/g,
+          (_, key: string, value: string) => `${key}"${value}"`,
+        );
+      }
+      const escapedJson = fixedJson.replace(/(^|[^\\])\\u/g, (_match, prefix: string) => `${prefix}\\\\u`);
+      return `${prefix}${escapedJson}${suffix}`;
+    },
+  );
+}
+
 function replaceTextNodes(html: string, replacements: string[]): string {
   if (!html.trim()) return html;
-  const $ = load(html);
+  const $ = load(html, { decodeEntities: false });
   let index = 0;
   $('*')
     .contents()
@@ -284,11 +347,28 @@ function replaceTextNodes(html: string, replacements: string[]): string {
       if (!hasAlpha && !hasDigit) return;
       if (hasDigit && !hasAlpha && !isCountupText) return;
       if (index < replacements.length) {
-        node.data = replacements[index];
+        const originalSlug = slugify(raw);
+        const newText = replacements[index];
+        node.data = newText;
+        if (originalSlug) {
+          const newSlug = slugify(newText);
+          if (newSlug && newSlug !== originalSlug) {
+            let ancestor: typeof parent | null = parent;
+            while (ancestor && ancestor.type === 'tag') {
+              const idAttr = ancestor.attribs?.id?.trim() ?? '';
+              if (idAttr && slugify(idAttr) === originalSlug) {
+                ancestor.attribs.id = newSlug;
+                break;
+              }
+              ancestor = (ancestor.parent as typeof parent) ?? null;
+            }
+          }
+        }
         index += 1;
       }
     });
-  return $.root().html() ?? html;
+  const serialized = serializeFragment($);
+  return serialized.length > 0 ? serialized : html;
 }
 
 async function deepseekRewrite(texts: string[], description: string): Promise<string[]> {
