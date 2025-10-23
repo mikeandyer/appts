@@ -41,6 +41,7 @@ let started = false;
 let processing = false;
 let pgPool;
 const templateCache = new Map();
+const localizedTitleCache = new Map();
 export function startJobWorker(pool) {
     pgPool = pool;
     if (started)
@@ -156,11 +157,13 @@ async function handleJob(job) {
             }, language);
             const fallbackTitle = getFallbackTitle(pageIntent, page.title);
             const fallbackSlug = getFallbackSlug(pageIntent, page.slug);
+            const localizedFallbackTitle = await localizeTitle(fallbackTitle, language, pageIntent);
+            newTitle = localizedFallbackTitle;
             if (meta?.title) {
-                newTitle = meta.title.trim() || fallbackTitle;
-            }
-            else {
-                newTitle = fallbackTitle;
+                const candidateTitle = meta.title.trim();
+                if (candidateTitle && !containsTemplateTokens(candidateTitle, page.slug)) {
+                    newTitle = candidateTitle;
+                }
             }
             let candidateSlug = meta?.slug ? slugify(meta.slug) : '';
             const originalNormalized = slugify(page.slug);
@@ -437,11 +440,56 @@ function getFallbackSlug(intent, original) {
     }
     return slugify(original);
 }
+async function localizeTitle(baseTitle, language, intent) {
+    if (!language)
+        return baseTitle;
+    const cacheKey = `${language}|${intent}|${baseTitle}`;
+    if (localizedTitleCache.has(cacheKey)) {
+        return localizedTitleCache.get(cacheKey) ?? baseTitle;
+    }
+    const languageHint = describeLanguage(language);
+    const prompt = '請將以下標題翻譯或改寫成指定語言，保持簡潔且符合頁面用途。' +
+        `語言：${languageHint}` +
+        (intent ? `，用途：${intent}` : '') +
+        `
+標題：${baseTitle}`;
+    try {
+        const response = await openai.chat.completions.create({
+            model: DEEPSEEK_MODEL,
+            messages: [
+                { role: 'system', content: '你是一位專業網站翻譯與在地化專家，只需回傳改寫後的標題。' },
+                { role: 'user', content: prompt },
+            ],
+            temperature: 0.2,
+            max_tokens: 120,
+        });
+        const content = response.choices.at(0)?.message?.content?.trim() ?? '';
+        if (content) {
+            localizedTitleCache.set(cacheKey, content);
+            return content;
+        }
+    }
+    catch (error) {
+        console.error('[worker] localizeTitle failed', error);
+    }
+    localizedTitleCache.set(cacheKey, baseTitle);
+    return baseTitle;
+}
+function containsTemplateTokens(title, originalSlug) {
+    const tokens = originalSlug.split('-');
+    const lowerTitle = title.toLowerCase();
+    for (let i = 0; i < tokens.length - 1; i += 1) {
+        const token = tokens[i];
+        if (!token)
+            continue;
+        if (lowerTitle.includes(token.toLowerCase())) {
+            return true;
+        }
+    }
+    return false;
+}
 function ensureUniqueSlug(candidate, fallbackSlug, existing) {
     let base = candidate || fallbackSlug || 'page';
-    if (!base) {
-        base = 'page';
-    }
     const used = new Set(existing.map((page) => page.slug));
     if (!used.has(base)) {
         return base;
