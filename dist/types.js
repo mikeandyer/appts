@@ -57,7 +57,8 @@ export function isAiBrief(value) {
         TONES.includes(record.tone) &&
         typeof record.color === 'string' &&
         typeof normalisedCandidate === 'string' &&
-        TEMPLATE_SLUGS.includes(normalisedCandidate));
+        TEMPLATE_SLUGS.includes(normalisedCandidate) &&
+        (record.language === undefined || typeof record.language === 'string'));
 }
 export function toAiBrief(value) {
     if (isAiBrief(value))
@@ -75,5 +76,6 @@ export function toAiBrief(value) {
         tone,
         color: typeof record.color === 'string' ? record.color : '#4f46e5',
         templateSlug,
+        language: typeof record.language === 'string' ? record.language : undefined,
     };
 }

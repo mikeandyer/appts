@@ -1,10 +1,25 @@
 import { createPool } from 'mysql2/promise';
 import { load } from 'cheerio';
 import OpenAI from 'openai';
+import { readFile } from 'fs/promises';
+import path from 'path';
 import { toAiBrief } from './types.js';
 const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY ?? '').trim();
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1').trim();
 const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL ?? 'deepseek-chat').trim();
+const TEMPLATE_EXPORT_PATH = process.env.TEMPLATE_EXPORT_PATH ?? path.resolve(process.cwd(), '../goldihost_pages_export.json');
+const TEMPLATE_PAGE_HINTS = {
+    home: { title: 'Home', slug: 'home', intent: 'home page' },
+    homepage: { title: 'Home', slug: 'home', intent: 'home page' },
+    services: { title: 'Services', slug: 'services', intent: 'services page' },
+    service: { title: 'Services', slug: 'services', intent: 'services page' },
+    about: { title: 'About Us', slug: 'about', intent: 'about page' },
+    contact: { title: 'Contact', slug: 'contact', intent: 'contact page' },
+    contactus: { title: 'Contact', slug: 'contact', intent: 'contact page' },
+    blog: { title: 'Blog', slug: 'blog', intent: 'blog page' },
+    faq: { title: 'FAQ', slug: 'faq', intent: 'FAQ page' },
+    testimonials: { title: 'Testimonials', slug: 'testimonials', intent: 'testimonials page' },
+};
 if (!DEEPSEEK_API_KEY) {
     console.warn('[worker] DEEPSEEK_API_KEY not set — rewrites will fail until configured.');
 }
@@ -25,6 +40,7 @@ const openai = new OpenAI({
 let started = false;
 let processing = false;
 let pgPool;
+const templateCache = new Map();
 export function startJobWorker(pool) {
     pgPool = pool;
     if (started)
@@ -121,14 +137,40 @@ async function handleJob(job) {
         if (pages.length === 0) {
             console.warn(`[worker] template '${effectiveTemplate}' returned no pages; using placeholder fallback.`);
         }
+        const language = typeof job.payload?.language === 'string' ? job.payload.language.trim() : '';
         const rewrittenPages = [];
         for (const page of payloadPages) {
             const textNodes = findAllTextNodes(page.html);
-            const replacements = await deepseekRewrite(textNodes, job.payload?.description ?? '');
+            const pageIntent = inferPageIntent(page.slug);
+            const replacements = await deepseekRewrite(textNodes, job.payload?.description ?? '', language, pageIntent);
             const newHtml = replaceTextNodes(page.html, replacements);
-            rewrittenPages.push({
-                slug: page.slug,
+            let newTitle = page.title;
+            let newSlug = page.slug;
+            const meta = await deepseekRewriteMeta({
                 title: page.title,
+                slug: page.slug,
+                description: job.payload?.description ?? '',
+                intent: pageIntent,
+                fallbackTitle: getFallbackTitle(pageIntent, page.title),
+                fallbackSlug: getFallbackSlug(pageIntent, page.slug),
+            }, language);
+            const fallbackTitle = getFallbackTitle(pageIntent, page.title);
+            const fallbackSlug = getFallbackSlug(pageIntent, page.slug);
+            if (meta?.title) {
+                newTitle = meta.title.trim() || fallbackTitle;
+            }
+            else {
+                newTitle = fallbackTitle;
+            }
+            let candidateSlug = meta?.slug ? slugify(meta.slug) : '';
+            const originalNormalized = slugify(page.slug);
+            if (!candidateSlug || candidateSlug === originalNormalized) {
+                candidateSlug = fallbackSlug;
+            }
+            newSlug = ensureUniqueSlug(candidateSlug, fallbackSlug, rewrittenPages);
+            rewrittenPages.push({
+                slug: newSlug,
+                title: newTitle,
                 html: newHtml,
             });
         }
@@ -174,6 +216,13 @@ async function fetchTemplatePagesFromWp(templateSlug) {
         title: row.post_title,
         html: row.post_content,
     }));
+    if (pages.length > 0) {
+        return { template: effectiveTemplate, pages };
+    }
+    const fallbackTemplates = await loadTemplatesFromExport(templateSlug);
+    if (fallbackTemplates.length > 0) {
+        return { template: templateSlug, pages: fallbackTemplates };
+    }
     return { template: effectiveTemplate, pages };
 }
 function fallbackPage() {
@@ -185,10 +234,50 @@ function fallbackPage() {
         },
     ];
 }
+async function loadTemplatesFromExport(templateSlug) {
+    if (templateCache.has(templateSlug)) {
+        return templateCache.get(templateSlug) ?? [];
+    }
+    try {
+        const raw = await readFile(TEMPLATE_EXPORT_PATH, 'utf8');
+        const json = JSON.parse(raw);
+        const prefix = `${templateSlug}-`;
+        const subset = [];
+        for (const entry of json) {
+            const post = entry.post;
+            if (!post)
+                continue;
+            const slug = post.post_name ?? '';
+            if (!slug.startsWith(prefix))
+                continue;
+            subset.push({
+                slug,
+                title: post.post_title ?? slug,
+                html: post.post_content ?? '',
+            });
+        }
+        templateCache.set(templateSlug, subset);
+        return subset;
+    }
+    catch (error) {
+        console.error('[worker] failed to load template export', TEMPLATE_EXPORT_PATH, error);
+        templateCache.set(templateSlug, []);
+        return [];
+    }
+}
+function slugify(text) {
+    return text
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 200);
+}
 function findAllTextNodes(html) {
     if (!html.trim())
         return [];
-    const $ = load(html);
+    const $ = load(html, { decodeEntities: false });
     const texts = [];
     $('*')
         .contents()
@@ -220,10 +309,54 @@ function findAllTextNodes(html) {
     });
     return texts;
 }
+function serializeNode($, node, depth = 0) {
+    if (depth > 50)
+        return ''; // safety guard against deep recursion
+    if (node.type === 'text') {
+        return node.data ?? '';
+    }
+    if (node.type === 'comment') {
+        return `<!--${node.data ?? ''}-->`;
+    }
+    if (node.type === 'tag') {
+        const el = node;
+        const tagName = el.name.toLowerCase();
+        if (tagName === 'html' || tagName === 'body' || tagName === 'head') {
+            const chunks = [];
+            $(node)
+                .contents()
+                .each((_, child) => {
+                chunks.push(serializeNode($, child, depth + 1));
+            });
+            return chunks.join('');
+        }
+        return $.html(node) ?? '';
+    }
+    return '';
+}
+function serializeFragment($) {
+    const pieces = [];
+    $.root()
+        .contents()
+        .each((_, node) => {
+        pieces.push(serializeNode($, node));
+    });
+    return normalizeStackableAttributes(pieces.join(''));
+}
+function normalizeStackableAttributes(html) {
+    return html.replace(/(<!--\s*wp:stackable\/([a-z0-9-]+)\s+)(\{[\s\S]*?\})(\s*-->)/gi, (match, prefix, blockName, jsonPart, suffix) => {
+        let fixedJson = jsonPart;
+        if (blockName === 'video-popup') {
+            fixedJson = fixedJson.replace(/("blockHeight"\s*:\s*)(-?\d+(?:\.\d+)?)(?=[,\}])/g, (_match, key, value) => `${key}"${value}"`);
+        }
+        const escapedJson = fixedJson.replace(/(^|[^\\])\\u/g, (_match, prefix) => `${prefix}\\\\u`);
+        return `${prefix}${escapedJson}${suffix}`;
+    });
+}
 function replaceTextNodes(html, replacements) {
     if (!html.trim())
         return html;
-    const $ = load(html);
+    const $ = load(html, { decodeEntities: false });
     let index = 0;
     $('*')
         .contents()
@@ -252,23 +385,90 @@ function replaceTextNodes(html, replacements) {
         if (hasDigit && !hasAlpha && !isCountupText)
             return;
         if (index < replacements.length) {
-            node.data = replacements[index];
+            const originalSlug = slugify(raw);
+            const newText = replacements[index];
+            node.data = newText;
+            if (originalSlug) {
+                const newSlug = slugify(newText);
+                if (newSlug && newSlug !== originalSlug) {
+                    let ancestor = parent;
+                    while (ancestor && ancestor.type === 'tag') {
+                        const idAttr = ancestor.attribs?.id?.trim() ?? '';
+                        if (idAttr && slugify(idAttr) === originalSlug) {
+                            ancestor.attribs.id = newSlug;
+                            break;
+                        }
+                        ancestor = ancestor.parent ?? null;
+                    }
+                }
+            }
             index += 1;
         }
     });
-    return $.root().html() ?? html;
+    const serialized = serializeFragment($);
+    return serialized.length > 0 ? serialized : html;
 }
-async function deepseekRewrite(texts, description) {
+function describeLanguage(locale) {
+    if (!locale)
+        return '';
+    return locale.replace(/_/g, '-');
+}
+function inferPageIntent(slug) {
+    if (!slug)
+        return '';
+    const parts = slug.split('-');
+    const last = parts.at(-1)?.toLowerCase() ?? '';
+    const hint = TEMPLATE_PAGE_HINTS[last];
+    return hint?.intent ?? '';
+}
+function getFallbackTitle(intent, original) {
+    for (const hint of Object.values(TEMPLATE_PAGE_HINTS)) {
+        if (hint.intent === intent) {
+            return hint.title;
+        }
+    }
+    return original;
+}
+function getFallbackSlug(intent, original) {
+    for (const hint of Object.values(TEMPLATE_PAGE_HINTS)) {
+        if (hint.intent === intent) {
+            return slugify(hint.slug);
+        }
+    }
+    return slugify(original);
+}
+function ensureUniqueSlug(candidate, fallbackSlug, existing) {
+    let base = candidate || fallbackSlug || 'page';
+    if (!base) {
+        base = 'page';
+    }
+    const used = new Set(existing.map((page) => page.slug));
+    if (!used.has(base)) {
+        return base;
+    }
+    let index = 2;
+    let next = `${base}-${index}`;
+    while (used.has(next)) {
+        index += 1;
+        next = `${base}-${index}`;
+    }
+    return next;
+}
+async function deepseekRewrite(texts, description, language, intent) {
     if (!texts.length)
         return texts;
     if (!DEEPSEEK_API_KEY)
         return texts;
+    const languageHint = language ? describeLanguage(language) : '依照 WordPress 語系或原始語言輸出';
     const systemMessage = '你是一位網站文案助理。' +
         '任務：根據使用者給的 `description` 與 `texts`，為網站改寫更專業、符合情境的字句。' +
+        `請使用指定語言輸出內容（${languageHint}）。` +
         '嚴格規定：只回傳【純 JSON 字串陣列】（長度需與 texts 相同），不得包含解說、Markdown 或任何多餘文字。' +
         '若無法改寫，保留原字串。';
     const userMessage = 'description：\n' +
         `${description}\n\n` +
+        'language：\n' +
+        `${language || '沿用 WordPress 使用者語言或原始語言'}\n\n` +
         'texts（請逐一改寫，保持順序一致）：\n' +
         `${JSON.stringify(texts)}\n\n` +
         '只回傳 JSON 陣列本體。';
@@ -322,4 +522,83 @@ function validateArray(value) {
     if (!Array.isArray(value))
         return [];
     return value.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
+}
+async function deepseekRewriteMeta(request, language) {
+    if (!DEEPSEEK_API_KEY)
+        return null;
+    const languageHint = language ? describeLanguage(language) : '依照 WordPress 語系或原始語言輸出';
+    const systemMessage = '你是一位網站導覽助理。' +
+        '任務：根據提供的基本資料，產出網站頁面的顯示標題與網址 slug。' +
+        `請使用指定語言輸出標題（${languageHint}），slug 必須使用英文字母、數字與連字號，全部小寫，不含空白或特殊符號。` +
+        '若已提供預設標題與 slug，請以此為基礎做在地化或必要調整。' +
+        '嚴格規定：只回傳 JSON 物件 {"title": "...", "slug": "..."}，不得包含其他文字。';
+    const userMessage = [
+        'current:',
+        `title: ${request.title}`,
+        `slug: ${request.slug}`,
+        '',
+        'description:',
+        `${request.description}`,
+        '',
+        'language:',
+        `${language || '沿用 WordPress 使用者語言或原始語言'}`,
+        '',
+        '請產出 JSON 物件。',
+    ].join('\n');
+    try {
+        const response = await openai.chat.completions.create({
+            model: DEEPSEEK_MODEL,
+            messages: [
+                { role: 'system', content: systemMessage },
+                { role: 'user', content: userMessage },
+            ],
+            temperature: 0.2,
+            max_tokens: 400,
+        });
+        const content = response.choices.at(0)?.message?.content?.trim() ?? '';
+        const parsed = parseJsonObject(content);
+        if (typeof parsed.intent === 'string' && !request.intent) {
+            request.intent = parsed.intent.trim();
+        }
+        const result = {};
+        if (typeof parsed.title === 'string') {
+            result.title = parsed.title.trim();
+        }
+        if (typeof parsed.slug === 'string') {
+            result.slug = parsed.slug.trim();
+        }
+        if (result.slug) {
+            result.slug = result.slug.replace(/[^a-zA-Z0-9-]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
+        }
+        return result;
+    }
+    catch (error) {
+        console.error('[worker] deepseek meta rewrite failed', error);
+        return null;
+    }
+}
+function parseJsonObject(raw) {
+    if (!raw)
+        return {};
+    try {
+        const parsed = JSON.parse(raw);
+        return validateRecord(parsed);
+    }
+    catch {
+        const start = raw.indexOf('{');
+        const end = raw.lastIndexOf('}');
+        if (start === -1 || end === -1 || start >= end)
+            return {};
+        try {
+            return validateRecord(JSON.parse(raw.slice(start, end + 1)));
+        }
+        catch {
+            return {};
+        }
+    }
+}
+function validateRecord(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return {};
+    return value;
 }

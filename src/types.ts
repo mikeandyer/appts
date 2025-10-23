@@ -6,6 +6,7 @@ export interface AiBrief {
   tone: Tone;
   color: string;
   templateSlug: string;
+  language?: string;
 }
 
 const TONES: readonly Tone[] = ['professional', 'friendly', 'playful', 'minimal'];
@@ -72,7 +73,8 @@ export function isAiBrief(value: unknown): value is AiBrief {
     TONES.includes(record.tone as Tone) &&
     typeof record.color === 'string' &&
     typeof normalisedCandidate === 'string' &&
-    (TEMPLATE_SLUGS as readonly string[]).includes(normalisedCandidate)
+    (TEMPLATE_SLUGS as readonly string[]).includes(normalisedCandidate) &&
+    (record.language === undefined || typeof record.language === 'string')
   );
 }
 
@@ -92,5 +94,6 @@ export function toAiBrief(value: unknown): AiBrief {
     tone,
     color: typeof record.color === 'string' ? record.color : '#4f46e5',
     templateSlug,
+    language: typeof record.language === 'string' ? record.language : undefined,
   };
 }
