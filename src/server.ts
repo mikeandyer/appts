@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
-import { AiBrief, isAiBrief } from './types.js';
+import { AiBrief, isAiBrief, toAiBrief } from './types.js';
 import { startJobWorker, triggerJobWorker } from './job-worker.js';
 
 const PORT = Number(process.env.PORT ?? process.env.AIB_PORT ?? 8000);
@@ -74,6 +74,7 @@ app.post<Record<string, never>, BuildResponseBody, unknown>(
     if (!isAiBrief(payload)) {
       return res.status(400).json({ ok: false, error: 'Invalid JSON payload' });
     }
+    const brief: AiBrief = toAiBrief(payload);
 
     try {
       const result = await pool.query<{ id: number | string }>(
@@ -82,7 +83,7 @@ app.post<Record<string, never>, BuildResponseBody, unknown>(
           VALUES ($1::jsonb, 'pending')
           RETURNING id
         `,
-        [JSON.stringify(payload)],
+        [JSON.stringify(brief)],
       );
 
       const rawId = result.rows[0]?.id;

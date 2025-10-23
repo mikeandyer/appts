@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import { Pool } from 'pg';
-import { isAiBrief } from './types.js';
+import { isAiBrief, toAiBrief } from './types.js';
 import { startJobWorker, triggerJobWorker } from './job-worker.js';
 const PORT = Number(process.env.PORT ?? process.env.AIB_PORT ?? 8000);
 const DATABASE_URL = process.env.DATABASE_URL ??
@@ -48,12 +48,13 @@ app.post('/build', async (req, res) => {
     if (!isAiBrief(payload)) {
         return res.status(400).json({ ok: false, error: 'Invalid JSON payload' });
     }
+    const brief = toAiBrief(payload);
     try {
         const result = await pool.query(`
           INSERT INTO aib_jobs (payload, status)
           VALUES ($1::jsonb, 'pending')
           RETURNING id
-        `, [JSON.stringify(payload)]);
+        `, [JSON.stringify(brief)]);
         const rawId = result.rows[0]?.id;
         const jobId = typeof rawId === 'string' ? Number.parseInt(rawId, 10) : typeof rawId === 'number' ? rawId : undefined;
         if (!jobId || Number.isNaN(jobId)) {

@@ -4,7 +4,7 @@ import type { RowDataPacket } from 'mysql2/promise';
 import { load } from 'cheerio';
 import OpenAI from 'openai';
 import { toAiBrief } from './types.js';
-import type { AiBrief } from './types.js';
+import type { AiBrief, TemplateSlug } from './types.js';
 
 type PendingJob = {
   id: number;
@@ -34,6 +34,8 @@ const mysqlPool: MysqlPool = createPool({
   waitForConnections: true,
   connectionLimit: Number(process.env.WP_DB_POOL_SIZE ?? 4),
 });
+
+const DEFAULT_TEMPLATE_SLUG: TemplateSlug = 'wood';
 
 const openai = new OpenAI({
   apiKey: DEEPSEEK_API_KEY || 'missing-key',
@@ -133,8 +135,14 @@ async function claimJob(): Promise<PendingJob | null> {
 
 async function handleJob(job: PendingJob): Promise<void> {
   try {
-    const pages = await fetchWoodPagesFromWp();
+    const requestedTemplate = (job.payload?.templateSlug as TemplateSlug) ?? DEFAULT_TEMPLATE_SLUG;
+    const { template: effectiveTemplate, pages } = await fetchTemplatePagesFromWp(requestedTemplate);
     const payloadPages = pages.length > 0 ? pages : fallbackPage();
+    if (pages.length === 0) {
+      console.warn(
+        `[worker] template '${effectiveTemplate}' returned no pages; using placeholder fallback.`,
+      );
+    }
 
     const rewrittenPages: PagePayload[] = [];
     for (const page of payloadPages) {
@@ -160,7 +168,9 @@ async function handleJob(job: PendingJob): Promise<void> {
       [bundle, job.id],
     );
 
-    console.log(`[worker] job ${job.id}: done (pages=${rewrittenPages.length})`);
+    console.log(
+      `[worker] job ${job.id}: done (template=${effectiveTemplate}, pages=${rewrittenPages.length})`,
+    );
   } catch (error) {
     console.error(`[worker] job ${job.id} failed`, error);
     await pgPool.query(
@@ -182,7 +192,9 @@ interface PageRow extends RowDataPacket {
   post_content: string;
 }
 
-async function fetchWoodPagesFromWp(): Promise<PagePayload[]> {
+async function fetchTemplatePagesFromWp(
+  templateSlug: TemplateSlug,
+): Promise<{ template: TemplateSlug; pages: PagePayload[] }> {
   const sql = `
     SELECT ID, post_title, post_name, post_content
     FROM wp_posts
@@ -191,13 +203,25 @@ async function fetchWoodPagesFromWp(): Promise<PagePayload[]> {
       AND post_name LIKE ?
     ORDER BY ID
   `;
-  const [rows] = await mysqlPool.execute<PageRow[]>(sql, ['wood-%']);
+  const pattern = `${templateSlug}-%`;
+  let [rows] = await mysqlPool.execute<PageRow[]>(sql, [pattern]);
+  let effectiveTemplate: TemplateSlug = templateSlug;
 
-  return rows.map((row) => ({
+  if (rows.length === 0 && templateSlug !== DEFAULT_TEMPLATE_SLUG) {
+    console.warn(
+      `[worker] no pages found for template '${templateSlug}', falling back to '${DEFAULT_TEMPLATE_SLUG}'.`,
+    );
+    [rows] = await mysqlPool.execute<PageRow[]>(sql, [`${DEFAULT_TEMPLATE_SLUG}-%`]);
+    effectiveTemplate = DEFAULT_TEMPLATE_SLUG;
+  }
+
+  const pages = rows.map((row) => ({
     slug: row.post_name,
     title: row.post_title,
     html: row.post_content,
   }));
+
+  return { template: effectiveTemplate, pages };
 }
 
 function fallbackPage(): PagePayload[] {

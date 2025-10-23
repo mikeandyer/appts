@@ -17,6 +17,7 @@ const mysqlPool = createPool({
     waitForConnections: true,
     connectionLimit: Number(process.env.WP_DB_POOL_SIZE ?? 4),
 });
+const DEFAULT_TEMPLATE_SLUG = 'wood';
 const openai = new OpenAI({
     apiKey: DEEPSEEK_API_KEY || 'missing-key',
     baseURL: DEEPSEEK_BASE_URL,
@@ -114,8 +115,12 @@ async function claimJob() {
 }
 async function handleJob(job) {
     try {
-        const pages = await fetchWoodPagesFromWp();
+        const requestedTemplate = job.payload?.templateSlug ?? DEFAULT_TEMPLATE_SLUG;
+        const { template: effectiveTemplate, pages } = await fetchTemplatePagesFromWp(requestedTemplate);
         const payloadPages = pages.length > 0 ? pages : fallbackPage();
+        if (pages.length === 0) {
+            console.warn(`[worker] template '${effectiveTemplate}' returned no pages; using placeholder fallback.`);
+        }
         const rewrittenPages = [];
         for (const page of payloadPages) {
             const textNodes = findAllTextNodes(page.html);
@@ -135,7 +140,7 @@ async function handleJob(job) {
             error_message = NULL
         WHERE id = $2
       `, [bundle, job.id]);
-        console.log(`[worker] job ${job.id}: done (pages=${rewrittenPages.length})`);
+        console.log(`[worker] job ${job.id}: done (template=${effectiveTemplate}, pages=${rewrittenPages.length})`);
     }
     catch (error) {
         console.error(`[worker] job ${job.id} failed`, error);
@@ -147,7 +152,7 @@ async function handleJob(job) {
       `, [error instanceof Error ? error.message : String(error), job.id]);
     }
 }
-async function fetchWoodPagesFromWp() {
+async function fetchTemplatePagesFromWp(templateSlug) {
     const sql = `
     SELECT ID, post_title, post_name, post_content
     FROM wp_posts
@@ -156,12 +161,20 @@ async function fetchWoodPagesFromWp() {
       AND post_name LIKE ?
     ORDER BY ID
   `;
-    const [rows] = await mysqlPool.execute(sql, ['wood-%']);
-    return rows.map((row) => ({
+    const pattern = `${templateSlug}-%`;
+    let [rows] = await mysqlPool.execute(sql, [pattern]);
+    let effectiveTemplate = templateSlug;
+    if (rows.length === 0 && templateSlug !== DEFAULT_TEMPLATE_SLUG) {
+        console.warn(`[worker] no pages found for template '${templateSlug}', falling back to '${DEFAULT_TEMPLATE_SLUG}'.`);
+        [rows] = await mysqlPool.execute(sql, [`${DEFAULT_TEMPLATE_SLUG}-%`]);
+        effectiveTemplate = DEFAULT_TEMPLATE_SLUG;
+    }
+    const pages = rows.map((row) => ({
         slug: row.post_name,
         title: row.post_title,
         html: row.post_content,
     }));
+    return { template: effectiveTemplate, pages };
 }
 function fallbackPage() {
     return [
