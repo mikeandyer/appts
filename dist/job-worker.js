@@ -8,6 +8,8 @@ const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY ?? '').trim();
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1').trim();
 const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL ?? 'deepseek-chat').trim();
 const TEMPLATE_EXPORT_PATH = process.env.TEMPLATE_EXPORT_PATH ?? path.resolve(process.cwd(), '../goldihost_pages_export.json');
+const PEXELS_API_KEY = (process.env.PEXELS_API_KEY ?? '').trim();
+const PEXELS_API_BASE_URL = (process.env.PEXELS_API_BASE_URL ?? 'https://api.pexels.com/v1').trim();
 const TEMPLATE_PAGE_HINTS = {
     home: { title: 'Home', slug: 'home', intent: 'home page' },
     homepage: { title: 'Home', slug: 'home', intent: 'home page' },
@@ -22,6 +24,9 @@ const TEMPLATE_PAGE_HINTS = {
 };
 if (!DEEPSEEK_API_KEY) {
     console.warn('[worker] DEEPSEEK_API_KEY not set — rewrites will fail until configured.');
+}
+if (!PEXELS_API_KEY) {
+    console.warn('[worker] PEXELS_API_KEY not set — hero image replacement will be skipped.');
 }
 const mysqlPool = createPool({
     host: process.env.WP_DB_HOST ?? '127.0.0.1',
@@ -140,11 +145,26 @@ async function handleJob(job) {
         }
         const language = typeof job.payload?.language === 'string' ? job.payload.language.trim() : '';
         const rewrittenPages = [];
+        let heroImage = null;
         for (const page of payloadPages) {
             const textNodes = findAllTextNodes(page.html);
             const pageIntent = inferPageIntent(page.slug);
             const replacements = await deepseekRewrite(textNodes, job.payload?.description ?? '', language, pageIntent);
-            const newHtml = replaceTextNodes(page.html, replacements);
+            let newHtml = replaceTextNodes(page.html, replacements);
+            if (!heroImage &&
+                shouldAttemptHeroReplacement({
+                    html: newHtml,
+                    pageSlug: page.slug,
+                    pageIndex: rewrittenPages.length,
+                })) {
+                heroImage = await selectHeroImage(job.payload, pageIntent, language);
+            }
+            if (heroImage) {
+                const swapped = replaceHeroImage(newHtml, heroImage);
+                if (swapped !== newHtml) {
+                    newHtml = swapped;
+                }
+            }
             let newTitle = page.title;
             let newSlug = page.slug;
             const meta = await deepseekRewriteMeta({
@@ -501,6 +521,223 @@ function ensureUniqueSlug(candidate, fallbackSlug, existing) {
         next = `${base}-${index}`;
     }
     return next;
+}
+function shouldAttemptHeroReplacement({ html, pageSlug, pageIndex, }) {
+    if (!PEXELS_API_KEY)
+        return false;
+    if (!html || !/<img\b/i.test(html))
+        return false;
+    if (/data-pexels-url/i.test(html))
+        return false;
+    if (pageIndex === 0)
+        return true;
+    const normalized = pageSlug.toLowerCase();
+    return normalized.includes('home') || normalized.includes('landing') || normalized.includes('hero');
+}
+async function selectHeroImage(brief, pageIntent, language) {
+    if (!PEXELS_API_KEY)
+        return null;
+    if (!brief)
+        return null;
+    const hasContext = Boolean(brief.description && brief.description.trim()) ||
+        Boolean(brief.industry && brief.industry.trim()) ||
+        Boolean(brief.businessName && brief.businessName.trim());
+    if (!hasContext)
+        return null;
+    const suggestions = await deepseekSuggestImageQueries(brief, pageIntent, language);
+    const fallbacks = [
+        [brief.businessName, brief.industry].filter(Boolean).join(' '),
+        [brief.industry, pageIntent].filter(Boolean).join(' '),
+        brief.description?.split(/[.!?]/, 1)?.[0] ?? '',
+    ];
+    const combined = [...suggestions, ...fallbacks].slice(0, 8);
+    const seen = new Set();
+    for (const candidate of combined) {
+        const query = candidate?.trim();
+        if (!query)
+            continue;
+        const key = query.toLowerCase();
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        const photo = await fetchPexelsHeroImage(query);
+        if (photo) {
+            console.log(`[worker] hero image selected via Pexels query "${query}"`);
+            return photo;
+        }
+    }
+    return null;
+}
+async function deepseekSuggestImageQueries(brief, pageIntent, language) {
+    if (!DEEPSEEK_API_KEY)
+        return [];
+    const descriptionLines = [
+        brief.businessName ? `品牌名稱：${brief.businessName}` : '',
+        brief.industry ? `產業：${brief.industry}` : '',
+        brief.description ? `描述：${brief.description}` : '',
+        brief.tone ? `語氣：${brief.tone}` : '',
+        pageIntent ? `頁面用途：${pageIntent}` : '',
+        language ? `語言：${language}` : '',
+    ]
+        .filter(Boolean)
+        .join('\n');
+    const systemMessage = '你是一位網站視覺設計助理。任務：根據提供的品牌資訊，產出 1 到 3 個英文關鍵字組合，用於搜尋符合品牌形象的形象照片。' +
+        '嚴格規定：只回傳 JSON 字串陣列，元素需為簡潔的英文片語，不得包含解說或其他文字。';
+    const userMessage = `${descriptionLines}\n\n請提供 JSON 陣列，例如 ["modern bakery storefront", "artisan bread display"].`;
+    try {
+        const response = await openai.chat.completions.create({
+            model: DEEPSEEK_MODEL,
+            messages: [
+                { role: 'system', content: systemMessage },
+                { role: 'user', content: userMessage },
+            ],
+            temperature: 0.4,
+            max_tokens: 400,
+        });
+        const content = response.choices.at(0)?.message?.content?.trim() ?? '';
+        const parsed = parseJsonArray(content);
+        return parsed.map((item) => item.trim()).filter(Boolean);
+    }
+    catch (error) {
+        console.error('[worker] deepseek image query suggestion failed', error);
+        return [];
+    }
+}
+async function fetchPexelsHeroImage(query) {
+    if (!PEXELS_API_KEY)
+        return null;
+    const params = new URLSearchParams();
+    params.set('query', query);
+    params.set('per_page', '6');
+    params.set('orientation', 'landscape');
+    params.set('size', 'large');
+    const endpoint = `${PEXELS_API_BASE_URL.replace(/\/+$/, '')}/search?${params.toString()}`;
+    try {
+        const response = await fetch(endpoint, {
+            headers: {
+                Authorization: PEXELS_API_KEY,
+            },
+        });
+        if (!response.ok) {
+            console.warn(`[worker] Pexels search failed (status=${response.status}) for query "${query}"`);
+            return null;
+        }
+        const data = (await response.json());
+        const photos = Array.isArray(data.photos) ? data.photos : [];
+        if (!photos.length)
+            return null;
+        let selected;
+        let bestArea = 0;
+        for (const photo of photos) {
+            const area = (photo.width ?? 0) * (photo.height ?? 0);
+            if (!selected || area > bestArea) {
+                selected = photo;
+                bestArea = area;
+            }
+        }
+        if (!selected)
+            return null;
+        const src = selected.src?.landscape ??
+            selected.src?.large2x ??
+            selected.src?.large ??
+            selected.src?.original ??
+            selected.src?.medium;
+        if (!src)
+            return null;
+        return {
+            url: src,
+            alt: selected.alt?.trim() || query,
+            photographer: selected.photographer ?? '',
+            attributionUrl: selected.url ?? selected.photographer_url ?? '',
+            query,
+        };
+    }
+    catch (error) {
+        console.error(`[worker] Pexels search error for query "${query}"`, error);
+        return null;
+    }
+}
+function replaceHeroImage(html, hero) {
+    if (!html.trim())
+        return html;
+    const $ = load(html, { decodeEntities: false });
+    const firstImg = $('img').first();
+    let replaced = false;
+    if (firstImg.length) {
+        firstImg.attr('src', hero.url);
+        firstImg.attr('alt', hero.alt || 'Hero image');
+        if (hero.photographer) {
+            firstImg.attr('data-pexels-photographer', hero.photographer);
+        }
+        else {
+            firstImg.removeAttr('data-pexels-photographer');
+        }
+        if (hero.attributionUrl) {
+            firstImg.attr('data-pexels-url', hero.attributionUrl);
+        }
+        else {
+            firstImg.removeAttr('data-pexels-url');
+        }
+        firstImg.attr('data-pexels-query', hero.query);
+        firstImg.removeAttr('srcset');
+        replaced = true;
+    }
+    if (!replaced) {
+        const backgroundElement = $('[style*="background-image"]').first();
+        if (backgroundElement.length) {
+            const styleAttr = backgroundElement.attr('style') ?? '';
+            const updatedStyle = styleAttr.replace(/background-image:\s*url\((['"]?)[^)]+?\1\)/i, (match) => {
+                return match.replace(/url\((['"]?)[^)]+?\1\)/i, `url(${hero.url})`);
+            });
+            if (updatedStyle !== styleAttr) {
+                backgroundElement.attr('style', updatedStyle);
+                backgroundElement.attr('data-pexels-query', hero.query);
+                if (hero.photographer) {
+                    backgroundElement.attr('data-pexels-photographer', hero.photographer);
+                }
+                else {
+                    backgroundElement.removeAttr('data-pexels-photographer');
+                }
+                if (hero.attributionUrl) {
+                    backgroundElement.attr('data-pexels-url', hero.attributionUrl);
+                }
+                else {
+                    backgroundElement.removeAttr('data-pexels-url');
+                }
+                replaced = true;
+            }
+        }
+    }
+    let serialized = serializeFragment($);
+    if (!serialized) {
+        return html;
+    }
+    if (!replaced) {
+        // Fallback to raw string replacement when DOM rewrite fails.
+        serialized = replaceFirstBackgroundUrl(serialized, hero.url);
+        return serialized;
+    }
+    serialized = replaceFirstBackgroundUrl(serialized, hero.url);
+    return serialized;
+}
+function replaceFirstBackgroundUrl(html, url) {
+    let updated = html;
+    const jsonPattern = /("blockBackgroundMediaUrl"\s*:\s*")([^"]+)(")/;
+    updated = updated.replace(jsonPattern, (_match, prefix, _oldUrl, suffix) => `${prefix}${escapeForJson(url)}${suffix}`);
+    const coverPattern = /("url"\s*:\s*")([^"]+)(")/;
+    updated = updated.replace(coverPattern, (match, prefix, _oldUrl, suffix) => {
+        // Only replace the first occurrence that looks like it belongs to a block definition.
+        if (match.includes('http')) {
+            return `${prefix}${escapeForJson(url)}${suffix}`;
+        }
+        return match;
+    });
+    const stylePattern = /(background-image:\s*url\()([^)]+)(\))/i;
+    updated = updated.replace(stylePattern, (_match, prefix, _old, suffix) => `${prefix}${url}${suffix}`);
+    return updated;
+}
+function escapeForJson(value) {
+    return JSON.stringify(value).slice(1, -1);
 }
 async function deepseekRewrite(texts, description, language, intent) {
     if (!texts.length)
