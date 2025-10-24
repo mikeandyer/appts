@@ -3,7 +3,7 @@ import { load } from 'cheerio';
 import OpenAI from 'openai';
 import { readFile } from 'fs/promises';
 import path from 'path';
-import { toAiBrief } from './types.js';
+import { normalizeUsePexelsHero, toAiBrief } from './types.js';
 const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY ?? '').trim();
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1').trim();
 const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL ?? 'deepseek-chat').trim();
@@ -144,6 +144,7 @@ async function handleJob(job) {
             console.warn(`[worker] template '${effectiveTemplate}' returned no pages; using placeholder fallback.`);
         }
         const language = typeof job.payload?.language === 'string' ? job.payload.language.trim() : '';
+        const allowPexelsHero = normalizeUsePexelsHero(job.payload?.usePexelsHero);
         const rewrittenPages = [];
         let heroImage = null;
         for (const page of payloadPages) {
@@ -151,15 +152,17 @@ async function handleJob(job) {
             const pageIntent = inferPageIntent(page.slug);
             const replacements = await deepseekRewrite(textNodes, job.payload?.description ?? '', language, pageIntent);
             let newHtml = replaceTextNodes(page.html, replacements);
-            if (!heroImage &&
+            const heroTarget = allowPexelsHero ? detectHeroTarget(newHtml) : null;
+            if (allowPexelsHero &&
+                !heroImage &&
                 shouldAttemptHeroReplacement({
                     html: newHtml,
                     pageSlug: page.slug,
                     pageIndex: rewrittenPages.length,
                 })) {
-                heroImage = await selectHeroImage(job.payload, pageIntent, language);
+                heroImage = await selectHeroImage(job.payload, pageIntent, language, heroTarget);
             }
-            if (heroImage) {
+            if (allowPexelsHero && heroImage) {
                 const swapped = replaceHeroImage(newHtml, heroImage);
                 if (swapped !== newHtml) {
                     newHtml = swapped;
@@ -525,7 +528,11 @@ function ensureUniqueSlug(candidate, fallbackSlug, existing) {
 function shouldAttemptHeroReplacement({ html, pageSlug, pageIndex, }) {
     if (!PEXELS_API_KEY)
         return false;
-    if (!html || !/<img\b/i.test(html))
+    if (!html.trim())
+        return false;
+    const hasImg = /<img\b/i.test(html);
+    const hasBackground = /background-image:\s*url\(/i.test(html) || /"blockBackgroundMediaUrl"\s*:\s*"/i.test(html);
+    if (!hasImg && !hasBackground)
         return false;
     if (/data-pexels-url/i.test(html))
         return false;
@@ -534,7 +541,7 @@ function shouldAttemptHeroReplacement({ html, pageSlug, pageIndex, }) {
     const normalized = pageSlug.toLowerCase();
     return normalized.includes('home') || normalized.includes('landing') || normalized.includes('hero');
 }
-async function selectHeroImage(brief, pageIntent, language) {
+async function selectHeroImage(brief, pageIntent, language, target) {
     if (!PEXELS_API_KEY)
         return null;
     if (!brief)
@@ -560,9 +567,12 @@ async function selectHeroImage(brief, pageIntent, language) {
         if (seen.has(key))
             continue;
         seen.add(key);
-        const photo = await fetchPexelsHeroImage(query);
+        const photo = await fetchPexelsHeroImage(query, target ?? undefined);
         if (photo) {
-            console.log(`[worker] hero image selected via Pexels query "${query}"`);
+            const dims = photo.width && photo.height
+                ? ` (${Math.round(photo.width)}x${Math.round(photo.height)})`
+                : '';
+            console.log(`[worker] hero image selected via Pexels query "${query}"${dims}`);
             return photo;
         }
     }
@@ -603,7 +613,7 @@ async function deepseekSuggestImageQueries(brief, pageIntent, language) {
         return [];
     }
 }
-async function fetchPexelsHeroImage(query) {
+async function fetchPexelsHeroImage(query, target) {
     if (!PEXELS_API_KEY)
         return null;
     const params = new URLSearchParams();
@@ -626,30 +636,20 @@ async function fetchPexelsHeroImage(query) {
         const photos = Array.isArray(data.photos) ? data.photos : [];
         if (!photos.length)
             return null;
-        let selected;
-        let bestArea = 0;
-        for (const photo of photos) {
-            const area = (photo.width ?? 0) * (photo.height ?? 0);
-            if (!selected || area > bestArea) {
-                selected = photo;
-                bestArea = area;
-            }
-        }
+        const selected = chooseBestPhoto(photos, target);
         if (!selected)
             return null;
-        const src = selected.src?.landscape ??
-            selected.src?.large2x ??
-            selected.src?.large ??
-            selected.src?.original ??
-            selected.src?.medium;
-        if (!src)
+        const { url, width, height } = buildPexelsUrl(selected, target);
+        if (!url)
             return null;
         return {
-            url: src,
+            url,
             alt: selected.alt?.trim() || query,
             photographer: selected.photographer ?? '',
             attributionUrl: selected.url ?? selected.photographer_url ?? '',
             query,
+            width,
+            height,
         };
     }
     catch (error) {
@@ -666,6 +666,12 @@ function replaceHeroImage(html, hero) {
     if (firstImg.length) {
         firstImg.attr('src', hero.url);
         firstImg.attr('alt', hero.alt || 'Hero image');
+        if (hero.width && !firstImg.attr('width')) {
+            firstImg.attr('width', String(Math.round(hero.width)));
+        }
+        if (hero.height && !firstImg.attr('height')) {
+            firstImg.attr('height', String(Math.round(hero.height)));
+        }
         if (hero.photographer) {
             firstImg.attr('data-pexels-photographer', hero.photographer);
         }
@@ -722,22 +728,299 @@ function replaceHeroImage(html, hero) {
 }
 function replaceFirstBackgroundUrl(html, url) {
     let updated = html;
-    const jsonPattern = /("blockBackgroundMediaUrl"\s*:\s*")([^"]+)(")/;
-    updated = updated.replace(jsonPattern, (_match, prefix, _oldUrl, suffix) => `${prefix}${escapeForJson(url)}${suffix}`);
-    const coverPattern = /("url"\s*:\s*")([^"]+)(")/;
-    updated = updated.replace(coverPattern, (match, prefix, _oldUrl, suffix) => {
-        // Only replace the first occurrence that looks like it belongs to a block definition.
-        if (match.includes('http')) {
-            return `${prefix}${escapeForJson(url)}${suffix}`;
-        }
-        return match;
+    let replacedJson = false;
+    updated = updated.replace(/("blockBackgroundMediaUrl"\s*:\s*")([^"]+)(")/, (_match, prefix, _oldUrl, suffix) => {
+        replacedJson = true;
+        return `${prefix}${escapeForJson(url)}${suffix}`;
     });
-    const stylePattern = /(background-image:\s*url\()([^)]+)(\))/i;
-    updated = updated.replace(stylePattern, (_match, prefix, _old, suffix) => `${prefix}${url}${suffix}`);
+    let replacedCover = false;
+    updated = updated.replace(/("url"\s*:\s*")([^"]+)(")/, (match, prefix, _oldUrl, suffix) => {
+        if (replacedCover)
+            return match;
+        if (!match.includes('http'))
+            return match;
+        replacedCover = true;
+        return `${prefix}${escapeForJson(url)}${suffix}`;
+    });
+    let replacedStyle = false;
+    updated = updated.replace(/(background-image:\s*url\()([^)]+)(\))/i, (_match, prefix, _old, suffix) => {
+        replacedStyle = true;
+        return `${prefix}${url}${suffix}`;
+    });
+    if (!replacedJson && !replacedCover && !replacedStyle) {
+        return updated;
+    }
     return updated;
 }
 function escapeForJson(value) {
     return JSON.stringify(value).slice(1, -1);
+}
+function detectHeroTarget(html) {
+    if (!html.trim())
+        return null;
+    const $ = load(html, { decodeEntities: false });
+    const img = $('img').first();
+    const imgWidth = parseDimension(img.attr('width')) ?? parseDimension(img.attr('data-width'));
+    const imgHeight = parseDimension(img.attr('height')) ?? parseDimension(img.attr('data-height'));
+    const style = img.attr('style') ?? '';
+    const styleWidth = parseDimensionFromStyle(style, 'width');
+    const styleHeight = parseDimensionFromStyle(style, 'height');
+    const aspectFromStyle = parseAspectRatio(style);
+    const width = imgWidth ?? styleWidth;
+    const height = imgHeight ?? styleHeight;
+    let aspect = aspectFromStyle;
+    if (width && height) {
+        aspect = aspect ?? width / height;
+        return { width, height, aspectRatio: aspect };
+    }
+    if (width && aspect) {
+        const inferredHeight = Math.max(1, Math.round(width / aspect));
+        return { width, height: inferredHeight, aspectRatio: aspect };
+    }
+    if (height && aspect) {
+        const inferredWidth = Math.max(1, Math.round(height * aspect));
+        return { width: inferredWidth, height, aspectRatio: aspect };
+    }
+    const background = $('[style*="background-image"]').first();
+    if (background.length) {
+        const bgStyle = background.attr('style') ?? '';
+        const bgWidth = parseDimensionFromStyle(bgStyle, 'width') ?? parseDimension(background.attr('data-width'));
+        const bgHeight = parseDimensionFromStyle(bgStyle, 'height') ??
+            parseDimension(background.attr('data-height')) ??
+            parseDimensionFromStyle(bgStyle, 'min-height');
+        const bgAspect = parseAspectRatio(bgStyle) ?? aspect;
+        if (bgWidth && bgHeight) {
+            return { width: bgWidth, height: bgHeight, aspectRatio: bgAspect ?? bgWidth / bgHeight };
+        }
+        if (bgWidth && bgAspect) {
+            return { width: bgWidth, height: Math.max(1, Math.round(bgWidth / bgAspect)), aspectRatio: bgAspect };
+        }
+        if (bgHeight && bgAspect) {
+            return { width: Math.max(1, Math.round(bgHeight * bgAspect)), height: bgHeight, aspectRatio: bgAspect };
+        }
+    }
+    const commentTarget = extractDimensionsFromComments(html);
+    if (commentTarget) {
+        return commentTarget;
+    }
+    if (aspect) {
+        return { aspectRatio: aspect };
+    }
+    return null;
+}
+function parseDimension(value) {
+    if (!value)
+        return undefined;
+    const match = String(value).match(/(-?\d+(?:\.\d+)?)/);
+    if (!match)
+        return undefined;
+    const num = Number.parseFloat(match[1]);
+    if (!Number.isFinite(num) || num <= 0)
+        return undefined;
+    return num;
+}
+function parseDimensionFromStyle(style, property) {
+    if (!style)
+        return undefined;
+    const regexp = new RegExp(`${property}\\s*:\\s*(-?\\d+(?:\\.\\d+)?)(px|rem|em|vw|vh)?`, 'i');
+    const match = style.match(regexp);
+    if (!match)
+        return undefined;
+    const num = Number.parseFloat(match[1]);
+    if (!Number.isFinite(num) || num <= 0)
+        return undefined;
+    const unit = match[2]?.toLowerCase() ?? 'px';
+    switch (unit) {
+        case 'px':
+            return num;
+        case 'rem':
+        case 'em':
+            return num * 16;
+        case 'vw':
+            return (num / 100) * 1920;
+        case 'vh':
+            return (num / 100) * 1080;
+        default:
+            return num;
+    }
+}
+function parseAspectRatio(style) {
+    if (!style)
+        return undefined;
+    const match = style.match(/aspect-ratio\s*:\s*([0-9.]+)\s*\/\s*([0-9.]+)/i);
+    if (match) {
+        const numerator = Number.parseFloat(match[1]);
+        const denominator = Number.parseFloat(match[2]);
+        if (Number.isFinite(numerator) && Number.isFinite(denominator) && denominator !== 0) {
+            return numerator / denominator;
+        }
+    }
+    const simple = style.match(/aspect-ratio\s*:\s*([0-9.]+)/i);
+    if (simple) {
+        const value = Number.parseFloat(simple[1]);
+        if (Number.isFinite(value) && value > 0) {
+            return value;
+        }
+    }
+    return undefined;
+}
+function extractDimensionsFromComments(html) {
+    const commentRegex = /<!--\s*wp:[^ ]+\s+(\{[\s\S]*?\})\s*-->/g;
+    let match;
+    while ((match = commentRegex.exec(html))) {
+        const jsonPart = match[1];
+        try {
+            const parsed = JSON.parse(jsonPart);
+            const width = parseDimension(parsed.width) ||
+                parseDimension(parsed.imageWidth) ||
+                parseDimension(parsed.resizedWidth);
+            const height = parseDimension(parsed.height) ||
+                parseDimension(parsed.imageHeight) ||
+                parseDimension(parsed.resizedHeight);
+            if (width && height) {
+                return { width, height, aspectRatio: width / height };
+            }
+            const ratio = parseDimension(parsed.aspectRatio ?? undefined);
+            if (width && ratio) {
+                return { width, height: Math.max(1, Math.round(width / ratio)), aspectRatio: ratio };
+            }
+            if (height && ratio) {
+                return { width: Math.max(1, Math.round(height * ratio)), height, aspectRatio: ratio };
+            }
+        }
+        catch {
+            continue;
+        }
+    }
+    return null;
+}
+function chooseBestPhoto(photos, target) {
+    if (!photos.length)
+        return undefined;
+    const targetRatio = target?.aspectRatio ??
+        (target?.width && target?.height && target.height !== 0 ? target.width / target.height : undefined);
+    const targetArea = target?.width && target?.height ? target.width * target.height : undefined;
+    let best;
+    let bestScore = Number.POSITIVE_INFINITY;
+    let bestArea = 0;
+    for (const photo of photos) {
+        const width = photo.width ?? 0;
+        const height = photo.height ?? 0;
+        const area = width * height;
+        const ratio = width && height ? width / height : undefined;
+        if (!targetRatio && !targetArea) {
+            if (!best || area > bestArea) {
+                best = photo;
+                bestArea = area;
+            }
+            continue;
+        }
+        let score = 0;
+        if (targetRatio && ratio) {
+            score += Math.abs(ratio - targetRatio);
+        }
+        if (targetArea && area) {
+            const areaDiff = Math.abs(area - targetArea);
+            const normalized = targetArea > 0 ? areaDiff / targetArea : areaDiff;
+            score += normalized * 0.1;
+        }
+        if (!best || score < bestScore || (score === bestScore && area > bestArea)) {
+            best = photo;
+            bestScore = score;
+            bestArea = area;
+        }
+    }
+    return best ?? photos[0];
+}
+function buildPexelsUrl(photo, target) {
+    const base = photo.src?.original ??
+        photo.src?.large2x ??
+        photo.src?.landscape ??
+        photo.src?.large ??
+        photo.src?.medium ??
+        photo.src?.small ??
+        '';
+    if (!base) {
+        return { url: '', width: photo.width, height: photo.height };
+    }
+    const targetRatio = target?.aspectRatio ??
+        (target?.width && target?.height && target.height !== 0 ? target.width / target.height : undefined);
+    let width = target?.width;
+    let height = target?.height;
+    if (width && !height && targetRatio) {
+        height = Math.max(1, Math.round(width / targetRatio));
+    }
+    if (height && !width && targetRatio) {
+        width = Math.max(1, Math.round(height * targetRatio));
+    }
+    if (!width && !height && targetRatio) {
+        width = Math.min(photo.width ?? 1600, 1600);
+        if (width && targetRatio) {
+            height = Math.max(1, Math.round(width / targetRatio));
+        }
+    }
+    if (width && height) {
+        const cropped = buildCroppedUrl(base, width, height);
+        return { url: cropped, width, height };
+    }
+    const fallbackUrl = photo.src?.landscape ??
+        photo.src?.large2x ??
+        photo.src?.large ??
+        photo.src?.original ??
+        photo.src?.medium ??
+        base;
+    const inferred = inferVariantDimensions(fallbackUrl, photo);
+    return { url: ensureDefaultParams(fallbackUrl), width: inferred?.width, height: inferred?.height };
+}
+function buildCroppedUrl(base, width, height) {
+    try {
+        const url = new URL(base);
+        url.searchParams.set('auto', 'compress');
+        url.searchParams.set('cs', 'tinysrgb');
+        url.searchParams.set('fit', 'crop');
+        url.searchParams.set('w', String(Math.max(1, Math.round(width))));
+        url.searchParams.set('h', String(Math.max(1, Math.round(height))));
+        return url.toString();
+    }
+    catch {
+        return base;
+    }
+}
+function ensureDefaultParams(urlStr) {
+    try {
+        const url = new URL(urlStr);
+        if (!url.searchParams.has('auto')) {
+            url.searchParams.set('auto', 'compress');
+        }
+        if (!url.searchParams.has('cs')) {
+            url.searchParams.set('cs', 'tinysrgb');
+        }
+        return url.toString();
+    }
+    catch {
+        return urlStr;
+    }
+}
+function inferVariantDimensions(url, photo) {
+    if (!url) {
+        return { width: photo.width, height: photo.height };
+    }
+    if (url === photo.src?.landscape) {
+        return { width: 1200, height: 627 };
+    }
+    if (url === photo.src?.large2x) {
+        return { width: 1880, height: 1253 };
+    }
+    if (url === photo.src?.large) {
+        return { width: 940, height: 627 };
+    }
+    if (url === photo.src?.medium) {
+        return { width: 350, height: 233 };
+    }
+    if (url === photo.src?.small) {
+        return { width: 130, height: 86 };
+    }
+    return { width: photo.width, height: photo.height };
 }
 async function deepseekRewrite(texts, description, language, intent) {
     if (!texts.length)

@@ -23,6 +23,17 @@ triggerJobWorker();
 
 app.use(express.json({ limit: '1mb' }));
 
+function parseBooleanFlag(value: string | undefined): boolean | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return undefined;
+}
+
+const shouldLogBuildPayloads = parseBooleanFlag(process.env.LOG_BUILD_PAYLOADS) ?? false;
+
 // Simple request logger to help with debugging.
 app.use((req: Request, res: Response, next: NextFunction) => {
   res.on('finish', () => {
@@ -72,9 +83,29 @@ app.post<Record<string, never>, BuildResponseBody, unknown>(
 
     const payload = req.body;
     if (!isAiBrief(payload)) {
+      if (shouldLogBuildPayloads) {
+        try {
+          console.log('[server] /build raw payload (invalid):', JSON.stringify(payload));
+        } catch {
+          console.log('[server] /build raw payload (invalid - non-serialisable)');
+        }
+      }
       return res.status(400).json({ ok: false, error: 'Invalid JSON payload' });
     }
     const brief: AiBrief = toAiBrief(payload);
+
+    if (shouldLogBuildPayloads) {
+      try {
+        console.log('[server] /build raw payload:', JSON.stringify(payload));
+      } catch {
+        console.log('[server] /build raw payload: [non-serialisable]');
+      }
+      try {
+        console.log('[server] /build normalized brief:', JSON.stringify(brief));
+      } catch {
+        console.log('[server] /build normalized brief: [non-serialisable]');
+      }
+    }
 
     try {
       const result = await pool.query<{ id: number | string }>(

@@ -7,6 +7,7 @@ export interface AiBrief {
   color: string;
   templateSlug: string;
   language?: string;
+  usePexelsHero?: boolean;
 }
 
 const TONES: readonly Tone[] = ['professional', 'friendly', 'playful', 'minimal'];
@@ -44,6 +45,32 @@ export const TEMPLATE_SLUGS = [
 
 export type TemplateSlug = (typeof TEMPLATE_SLUGS)[number];
 
+const FALSE_LITERALS = new Set(['false', '0', 'off', 'no']);
+const TRUE_LITERALS = new Set(['true', '1', 'on', 'yes']);
+
+function normalizeBooleanLike(raw: unknown): boolean | undefined {
+  if (typeof raw === 'boolean') return raw;
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw)) return undefined;
+    return raw !== 0;
+  }
+  if (typeof raw === 'string') {
+    const normalised = raw.trim().toLowerCase();
+    if (normalised === '') return undefined;
+    if (FALSE_LITERALS.has(normalised)) return false;
+    if (TRUE_LITERALS.has(normalised)) return true;
+  }
+  return undefined;
+}
+
+export function normalizeUsePexelsHero(raw: unknown): boolean {
+  const parsed = normalizeBooleanLike(raw);
+  if (parsed === undefined) {
+    return true;
+  }
+  return parsed;
+}
+
 function normaliseTemplateSlug(raw: unknown): TemplateSlug {
   const slug = typeof raw === 'string' ? raw : '';
   const candidate = slug
@@ -74,12 +101,19 @@ export function isAiBrief(value: unknown): value is AiBrief {
     typeof record.color === 'string' &&
     typeof normalisedCandidate === 'string' &&
     (TEMPLATE_SLUGS as readonly string[]).includes(normalisedCandidate) &&
-    (record.language === undefined || typeof record.language === 'string')
+    (record.language === undefined || typeof record.language === 'string') &&
+    (record.usePexelsHero === undefined || normalizeBooleanLike(record.usePexelsHero) !== undefined)
   );
 }
 
 export function toAiBrief(value: unknown): AiBrief {
-  if (isAiBrief(value)) return value;
+  if (isAiBrief(value)) {
+    const brief = value as AiBrief;
+    return {
+      ...brief,
+      usePexelsHero: normalizeUsePexelsHero(brief.usePexelsHero),
+    };
+  }
   const record = (value as Record<string, unknown>) ?? {};
   const tone = typeof record.tone === 'string' && TONES.includes(record.tone as Tone)
     ? (record.tone as Tone)
@@ -95,5 +129,6 @@ export function toAiBrief(value: unknown): AiBrief {
     color: typeof record.color === 'string' ? record.color : '#4f46e5',
     templateSlug,
     language: typeof record.language === 'string' ? record.language : undefined,
+    usePexelsHero: normalizeUsePexelsHero(record.usePexelsHero),
   };
 }
