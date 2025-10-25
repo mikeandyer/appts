@@ -1,21 +1,19 @@
 import { load } from 'cheerio';
 import { serializeFragment } from './html-utils.js';
 import { parseJsonArray } from './utils.js';
-export function shouldAttemptHeroReplacement({ html, pageSlug, pageIndex, apiKey, }) {
+export function shouldAttemptHeroReplacement({ html, pageSlug: _pageSlug, pageIndex: _pageIndex, apiKey, }) {
     if (!apiKey)
         return false;
     if (!html.trim())
         return false;
-    const hasImg = /<img\b/i.test(html);
-    const hasBackground = /background-image:\s*url\(/i.test(html) || /"blockBackgroundMediaUrl"\s*:\s*"/i.test(html);
-    if (!hasImg && !hasBackground)
+    const trimmed = html.trim();
+    if (!trimmed)
         return false;
-    if (/data-pexels-url/i.test(html))
+    if (/data-pexels-url/i.test(trimmed))
         return false;
-    if (pageIndex === 0)
-        return true;
-    const normalized = pageSlug.toLowerCase();
-    return normalized.includes('home') || normalized.includes('landing') || normalized.includes('hero');
+    const hasImg = /<img\b/i.test(trimmed);
+    const hasBackground = /background-image:\s*url\(/i.test(trimmed) || /"blockBackgroundMediaUrl"\s*:\s*"/i.test(trimmed);
+    return hasImg || hasBackground;
 }
 export async function selectHeroImage(brief, pageIntent, language, target, config) {
     const pexelsKey = config.pexelsApiKey.trim();
@@ -52,6 +50,128 @@ export async function selectHeroImage(brief, pageIntent, language, target, confi
         }
     }
     return null;
+}
+export async function selectPexelsImageBatch(brief, pageIntent, language, targets, config, options) {
+    if (!targets.length)
+        return [];
+    const pexelsKey = config.pexelsApiKey.trim();
+    if (!pexelsKey)
+        return [];
+    if (!brief)
+        return [];
+    const hasContext = Boolean(brief.description && brief.description.trim()) ||
+        Boolean(brief.industry && brief.industry.trim()) ||
+        Boolean(brief.businessName && brief.businessName.trim());
+    if (!hasContext)
+        return [];
+    const suggestions = await deepseekSuggestImageQueries(brief, pageIntent, language, config);
+    const fallbacks = [
+        [brief.businessName, brief.industry].filter(Boolean).join(' '),
+        [brief.industry, pageIntent].filter(Boolean).join(' '),
+        brief.description?.split(/[.!?]/, 1)?.[0] ?? '',
+        `${brief.tone ?? ''} ${brief.industry ?? ''}`.trim(),
+    ];
+    const combinedQueries = [...new Set([...suggestions, ...fallbacks].map((item) => item?.trim()).filter(Boolean))];
+    if (!combinedQueries.length)
+        return [];
+    const maxImages = Math.min(options?.maxImages ?? targets.length, targets.length);
+    const usedPhotoIds = new Set();
+    const queryCache = new Map();
+    const results = [];
+    for (let slotIndex = 0; slotIndex < maxImages; slotIndex += 1) {
+        const target = targets[slotIndex] ?? null;
+        const queryRotationStart = slotIndex % combinedQueries.length;
+        const rotatedQueries = [
+            ...combinedQueries.slice(queryRotationStart),
+            ...combinedQueries.slice(0, queryRotationStart),
+        ];
+        let selectedPhoto = null;
+        let selectedQuery = '';
+        for (const query of rotatedQueries) {
+            if (!query)
+                continue;
+            if (!queryCache.has(query)) {
+                const photos = await searchPexelsPhotos(query, config, { perPage: 15 });
+                queryCache.set(query, photos);
+            }
+            const cached = queryCache.get(query) ?? [];
+            const available = cached.filter((photo) => !usedPhotoIds.has(photo.id));
+            if (!available.length)
+                continue;
+            const ranked = sortPhotosForTarget(available, target ?? undefined);
+            if (!ranked.length)
+                continue;
+            selectedPhoto = ranked[0];
+            selectedQuery = query;
+            break;
+        }
+        if (!selectedPhoto) {
+            break;
+        }
+        usedPhotoIds.add(selectedPhoto.id);
+        const { url, width, height } = buildPexelsUrl(selectedPhoto, target ?? undefined);
+        if (!url)
+            continue;
+        results.push({
+            id: selectedPhoto.id,
+            url,
+            alt: selectedPhoto.alt?.trim() || selectedQuery || brief.businessName || 'Hero image',
+            photographer: selectedPhoto.photographer ?? '',
+            attributionUrl: selectedPhoto.url ?? selectedPhoto.photographer_url ?? '',
+            query: selectedQuery,
+            width,
+            height,
+        });
+    }
+    return results;
+}
+export async function replacePageImagesWithPexels(html, brief, pageIntent, language, config, options) {
+    const trimmed = html?.trim() ?? '';
+    if (!trimmed)
+        return { html, replacements: [] };
+    const pexelsKey = config.pexelsApiKey.trim();
+    if (!pexelsKey)
+        return { html, replacements: [] };
+    const shouldReplace = options?.force || /<img\b/i.test(trimmed) || /background-image:\s*url\(/i.test(trimmed);
+    if (!shouldReplace) {
+        return { html, replacements: [] };
+    }
+    const $ = load(trimmed, { decodeEntities: false });
+    const slots = collectImageSlots($);
+    if (!slots.length) {
+        return { html, replacements: [] };
+    }
+    const maxImages = Math.min(options?.maxImages ?? 8, slots.length);
+    const targets = slots.slice(0, maxImages).map((slot) => slot.target);
+    const selected = await selectPexelsImageBatch(brief, pageIntent, language, targets, config, { maxImages });
+    if (!selected.length) {
+        return { html, replacements: [] };
+    }
+    const replacements = [];
+    for (let index = 0; index < selected.length; index += 1) {
+        const image = selected[index];
+        const slot = slots[index];
+        if (!slot || !image)
+            continue;
+        if (slot.kind === 'img') {
+            applyImageToElement(slot.element, image);
+            replacements.push({ elementIndex: slot.position, kind: 'img', image });
+        }
+        else {
+            const updated = applyBackgroundToElement(slot.element, image);
+            if (updated) {
+                replacements.push({ elementIndex: slot.position, kind: 'background', image });
+            }
+        }
+    }
+    let serialized = serializeFragment($);
+    if (!serialized) {
+        return { html, replacements: [] };
+    }
+    for (const replacement of replacements) {
+        serialized = replaceFirstBackgroundUrl(serialized, replacement.image.url);
+    }
+    return { html: serialized, replacements };
 }
 async function deepseekSuggestImageQueries(brief, pageIntent, language, config) {
     const apiKey = config.deepseekApiKey.trim();
@@ -93,25 +213,8 @@ async function fetchPexelsHeroImage(query, target, config) {
     const apiKey = config.pexelsApiKey.trim();
     if (!apiKey)
         return null;
-    const params = new URLSearchParams();
-    params.set('query', query);
-    params.set('per_page', '6');
-    params.set('orientation', 'landscape');
-    params.set('size', 'large');
-    const baseUrl = (config.pexelsApiBaseUrl || 'https://api.pexels.com/v1').replace(/\/+$/, '');
-    const endpoint = `${baseUrl}/search?${params.toString()}`;
     try {
-        const response = await fetch(endpoint, {
-            headers: {
-                Authorization: apiKey,
-            },
-        });
-        if (!response.ok) {
-            console.warn(`[worker] Pexels search failed (status=${response.status}) for query "${query}"`);
-            return null;
-        }
-        const data = (await response.json());
-        const photos = Array.isArray(data.photos) ? data.photos : [];
+        const photos = await searchPexelsPhotos(query, config, { perPage: 12 });
         if (!photos.length)
             return null;
         const selected = chooseBestPhoto(photos, target);
@@ -121,6 +224,7 @@ async function fetchPexelsHeroImage(query, target, config) {
         if (!url)
             return null;
         return {
+            id: selected.id,
             url,
             alt: selected.alt?.trim() || query,
             photographer: selected.photographer ?? '',
@@ -133,6 +237,39 @@ async function fetchPexelsHeroImage(query, target, config) {
     catch (error) {
         console.error(`[worker] Pexels search error for query "${query}"`, error);
         return null;
+    }
+}
+async function searchPexelsPhotos(query, config, options) {
+    const apiKey = config.pexelsApiKey.trim();
+    if (!apiKey)
+        return [];
+    const params = new URLSearchParams();
+    params.set('query', query);
+    params.set('per_page', String(options?.perPage ?? 15));
+    if (options?.page) {
+        params.set('page', String(options.page));
+    }
+    params.set('orientation', 'landscape');
+    params.set('size', 'large');
+    const baseUrl = (config.pexelsApiBaseUrl || 'https://api.pexels.com/v1').replace(/\/+$/, '');
+    const endpoint = `${baseUrl}/search?${params.toString()}`;
+    try {
+        const response = await fetch(endpoint, {
+            headers: {
+                Authorization: apiKey,
+            },
+        });
+        if (!response.ok) {
+            console.warn(`[worker] Pexels search failed (status=${response.status}) for query "${query}"`);
+            return [];
+        }
+        const data = (await response.json());
+        const photos = Array.isArray(data.photos) ? data.photos : [];
+        return photos;
+    }
+    catch (error) {
+        console.error(`[worker] Pexels search error for query "${query}"`, error);
+        return [];
     }
 }
 export function replaceHeroImage(html, hero) {
@@ -381,26 +518,7 @@ function chooseBestPhoto(photos, target) {
     let bestScore = Number.POSITIVE_INFINITY;
     let bestArea = 0;
     for (const photo of photos) {
-        const width = photo.width ?? 0;
-        const height = photo.height ?? 0;
-        const area = width * height;
-        const ratio = width && height ? width / height : undefined;
-        if (!targetRatio && !targetArea) {
-            if (!best || area > bestArea) {
-                best = photo;
-                bestArea = area;
-            }
-            continue;
-        }
-        let score = 0;
-        if (targetRatio && ratio) {
-            score += Math.abs(ratio - targetRatio);
-        }
-        if (targetArea && area) {
-            const areaDiff = Math.abs(area - targetArea);
-            const normalized = targetArea > 0 ? areaDiff / targetArea : areaDiff;
-            score += normalized * 0.1;
-        }
+        const { score, area } = scorePhotoForTarget(photo, target);
         if (!best || score < bestScore || (score === bestScore && area > bestArea)) {
             best = photo;
             bestScore = score;
@@ -408,6 +526,38 @@ function chooseBestPhoto(photos, target) {
         }
     }
     return best ?? photos[0];
+}
+function sortPhotosForTarget(photos, target) {
+    return [...photos].sort((a, b) => {
+        const aScore = scorePhotoForTarget(a, target);
+        const bScore = scorePhotoForTarget(b, target);
+        if (aScore.score !== bScore.score) {
+            return aScore.score - bScore.score;
+        }
+        return bScore.area - aScore.area;
+    });
+}
+function scorePhotoForTarget(photo, target) {
+    const width = photo.width ?? 0;
+    const height = photo.height ?? 0;
+    const area = width * height;
+    const ratio = width && height ? width / height : undefined;
+    const targetRatio = target?.aspectRatio ??
+        (target?.width && target?.height && target.height !== 0 ? target.width / target.height : undefined);
+    const targetArea = target?.width && target?.height ? target.width * target.height : undefined;
+    if (!targetRatio && !targetArea) {
+        return { score: area ? 1 / area : Number.POSITIVE_INFINITY, area };
+    }
+    let score = 0;
+    if (targetRatio && ratio) {
+        score += Math.abs(ratio - targetRatio);
+    }
+    if (targetArea && area) {
+        const areaDiff = Math.abs(area - targetArea);
+        const normalized = targetArea > 0 ? areaDiff / targetArea : areaDiff;
+        score += normalized * 0.1;
+    }
+    return { score, area };
 }
 function buildPexelsUrl(photo, target) {
     const base = photo.src?.original ??
@@ -490,4 +640,178 @@ function inferVariantDimensions(url, photo) {
     catch {
         return { width: photo.width ?? undefined, height: photo.height ?? undefined };
     }
+}
+function collectImageSlots($) {
+    const slots = [];
+    let position = 0;
+    $('img').each((_, node) => {
+        const element = $(node);
+        if (shouldSkipImageElement(element))
+            return;
+        const target = detectTargetFromImage(element);
+        slots.push({
+            kind: 'img',
+            element,
+            target,
+            position,
+        });
+        position += 1;
+    });
+    $('[style*="background-image"]').each((_, node) => {
+        const element = $(node);
+        if (shouldSkipBackgroundElement(element))
+            return;
+        const target = detectTargetFromBackground(element);
+        slots.push({
+            kind: 'background',
+            element,
+            target,
+            position,
+        });
+        position += 1;
+    });
+    return slots;
+}
+function shouldSkipImageElement(element) {
+    if (!element || element.length === 0)
+        return true;
+    if (element.attr('data-pexels-url'))
+        return true;
+    const existingSrc = element.attr('src') ?? '';
+    if (!existingSrc)
+        return false;
+    if (existingSrc.startsWith('data:'))
+        return true;
+    if (existingSrc.endsWith('.svg'))
+        return true;
+    const className = element.attr('class') ?? '';
+    if (/\blogo\b/i.test(className))
+        return true;
+    if (/\bavatar\b/i.test(className))
+        return true;
+    if (/\bicon\b/i.test(className))
+        return true;
+    if (/\bsocial\b/i.test(className))
+        return true;
+    const width = parseDimension(element.attr('width'));
+    const height = parseDimension(element.attr('height'));
+    if (width && width < 80)
+        return true;
+    if (height && height < 80)
+        return true;
+    return false;
+}
+function shouldSkipBackgroundElement(element) {
+    if (!element || element.length === 0)
+        return true;
+    if (element.attr('data-pexels-url'))
+        return true;
+    const style = element.attr('style') ?? '';
+    if (!/background-image:\s*url\(/i.test(style))
+        return true;
+    if (/gradient/i.test(style))
+        return true;
+    return false;
+}
+function detectTargetFromImage(element) {
+    const width = parseDimension(element.attr('width')) ||
+        parseDimension(element.attr('data-width')) ||
+        parseDimensionFromStyle(element.attr('style') ?? '', 'width');
+    const height = parseDimension(element.attr('height')) ||
+        parseDimension(element.attr('data-height')) ||
+        parseDimensionFromStyle(element.attr('style') ?? '', 'height');
+    const aspect = parseAspectRatio(element.attr('style') ?? '') ?? (width && height ? width / height : undefined);
+    if (width && height) {
+        return { width, height, aspectRatio: aspect ?? width / height };
+    }
+    if (width && aspect) {
+        return { width, height: Math.max(1, Math.round(width / aspect)), aspectRatio: aspect };
+    }
+    if (height && aspect) {
+        return { width: Math.max(1, Math.round(height * aspect)), height, aspectRatio: aspect };
+    }
+    if (aspect) {
+        return { aspectRatio: aspect };
+    }
+    return null;
+}
+function detectTargetFromBackground(element) {
+    const style = element.attr('style') ?? '';
+    const width = parseDimensionFromStyle(style, 'width') ||
+        parseDimension(element.attr('data-width')) ||
+        parseDimension(element.attr('data-block-width'));
+    const height = parseDimensionFromStyle(style, 'height') ||
+        parseDimensionFromStyle(style, 'min-height') ||
+        parseDimension(element.attr('data-height')) ||
+        parseDimension(element.attr('data-block-height'));
+    const aspect = parseAspectRatio(style) ??
+        (width && height ? width / height : undefined) ??
+        parseDimension(element.attr('data-aspect'));
+    if (width && height) {
+        return { width, height, aspectRatio: aspect ?? width / height };
+    }
+    if (width && aspect) {
+        return { width, height: Math.max(1, Math.round(width / aspect)), aspectRatio: aspect };
+    }
+    if (height && aspect) {
+        return { width: Math.max(1, Math.round(height * aspect)), height, aspectRatio: aspect };
+    }
+    if (aspect) {
+        return { aspectRatio: aspect };
+    }
+    return null;
+}
+function applyImageToElement(element, image) {
+    element.attr('src', image.url);
+    element.attr('alt', image.alt || 'Hero image');
+    if (image.width && !element.attr('width')) {
+        element.attr('width', String(Math.round(image.width)));
+    }
+    if (image.height && !element.attr('height')) {
+        element.attr('height', String(Math.round(image.height)));
+    }
+    if (image.photographer) {
+        element.attr('data-pexels-photographer', image.photographer);
+    }
+    else {
+        element.removeAttr('data-pexels-photographer');
+    }
+    if (image.attributionUrl) {
+        element.attr('data-pexels-url', image.attributionUrl);
+    }
+    else {
+        element.removeAttr('data-pexels-url');
+    }
+    element.attr('data-pexels-query', image.query);
+    element.removeAttr('srcset');
+}
+function applyBackgroundToElement(element, image) {
+    const styleAttr = element.attr('style') ?? '';
+    const updatedStyle = styleAttr.replace(/background-image:\s*url\((['"]?)[^)]+?\1\)/i, (match) => {
+        return match.replace(/url\((['"]?)[^)]+?\1\)/i, `url(${image.url})`);
+    });
+    if (updatedStyle !== styleAttr) {
+        element.attr('style', updatedStyle);
+        element.attr('data-pexels-query', image.query);
+        if (image.photographer) {
+            element.attr('data-pexels-photographer', image.photographer);
+        }
+        else {
+            element.removeAttr('data-pexels-photographer');
+        }
+        if (image.attributionUrl) {
+            element.attr('data-pexels-url', image.attributionUrl);
+        }
+        else {
+            element.removeAttr('data-pexels-url');
+        }
+        if (image.width) {
+            element.attr('data-width', String(Math.round(image.width)));
+        }
+        if (image.height) {
+            element.attr('data-height', String(Math.round(image.height)));
+        }
+        return true;
+    }
+    return false;
 }

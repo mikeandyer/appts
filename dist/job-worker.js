@@ -5,7 +5,7 @@ import { readFile } from 'fs/promises';
 import path from 'path';
 import { normalizeUsePexelsHero, toAiBrief } from './types.js';
 import { serializeFragment } from './html-utils.js';
-import { detectHeroTarget, replaceHeroImage, selectHeroImage, shouldAttemptHeroReplacement, } from './pexels.js';
+import { replacePageImagesWithPexels, shouldAttemptHeroReplacement, } from './pexels.js';
 import { parseJsonArray } from './utils.js';
 const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY ?? '').trim();
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1').trim();
@@ -156,27 +156,23 @@ async function handleJob(job) {
         const language = typeof job.payload?.language === 'string' ? job.payload.language.trim() : '';
         const allowPexelsHero = normalizeUsePexelsHero(job.payload?.usePexelsHero);
         const rewrittenPages = [];
-        let heroImage = null;
         for (const page of payloadPages) {
             const textNodes = findAllTextNodes(page.html);
             const pageIntent = inferPageIntent(page.slug);
             const replacements = await deepseekRewrite(textNodes, job.payload?.description ?? '', language, pageIntent);
             let newHtml = replaceTextNodes(page.html, replacements);
-            const heroTarget = allowPexelsHero ? detectHeroTarget(newHtml) : null;
             if (allowPexelsHero &&
-                !heroImage &&
+                heroImageConfig.pexelsApiKey &&
                 shouldAttemptHeroReplacement({
                     html: newHtml,
                     pageSlug: page.slug,
                     pageIndex: rewrittenPages.length,
                     apiKey: heroImageConfig.pexelsApiKey,
                 })) {
-                heroImage = await selectHeroImage(job.payload, pageIntent, language, heroTarget, heroImageConfig);
-            }
-            if (allowPexelsHero && heroImage) {
-                const swapped = replaceHeroImage(newHtml, heroImage);
-                if (swapped !== newHtml) {
-                    newHtml = swapped;
+                const imageResult = await replacePageImagesWithPexels(newHtml, job.payload, pageIntent, language, heroImageConfig, { maxImages: 10 });
+                if (imageResult.replacements.length > 0) {
+                    newHtml = imageResult.html;
+                    console.log(`[worker] applied ${imageResult.replacements.length} Pexels image(s) on page "${page.slug}"`);
                 }
             }
             let newTitle = page.title;
