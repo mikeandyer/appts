@@ -3,7 +3,7 @@ import { createPool, Pool as MysqlPool } from 'mysql2/promise';
 import type { RowDataPacket } from 'mysql2/promise';
 import { load } from 'cheerio';
 import type { CheerioAPI, CheerioOptions } from 'cheerio';
-import OpenAI from 'openai';
+import OpenAI from 'openai/index.mjs';
 import { readFile } from 'fs/promises';
 import path from 'path';
 import { normalizeUsePexelsHero, toAiBrief } from './types.js';

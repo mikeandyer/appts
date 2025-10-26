@@ -1,7 +1,7 @@
 import { load } from 'cheerio';
 import type { Cheerio, CheerioAPI } from 'cheerio';
 import type { AnyNode } from 'domhandler';
-import type OpenAI from 'openai';
+import type OpenAI from 'openai/index.mjs';
 import type { AiBrief } from './types.js';
 import { serializeFragment } from './html-utils.js';
 import { parseJsonArray } from './utils.js';
