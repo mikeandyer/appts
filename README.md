@@ -41,3 +41,4 @@ npm start        # run compiled build
 ```
 
 The process listens on `PORT` (default `8000`). A background loop continuously claims pending rows from `aib_jobs`, fetches `wood-*` pages from WordPress MySQL, rewrites text with OpenAI GPT, and writes the finished bundle back to PostgreSQL—mirroring the Python worker.
+# aibreactbackend
