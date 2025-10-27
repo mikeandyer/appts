@@ -26,7 +26,7 @@ export async function selectHeroImage(brief, pageIntent, language, target, confi
         Boolean(brief.businessName && brief.businessName.trim());
     if (!hasContext)
         return null;
-    const suggestions = await deepseekSuggestImageQueries(brief, pageIntent, language, config);
+    const suggestions = await suggestImageQueries(brief, pageIntent, language, config);
     const fallbacks = [
         [brief.businessName, brief.industry].filter(Boolean).join(' '),
         [brief.industry, pageIntent].filter(Boolean).join(' '),
@@ -64,7 +64,7 @@ export async function selectPexelsImageBatch(brief, pageIntent, language, target
         Boolean(brief.businessName && brief.businessName.trim());
     if (!hasContext)
         return [];
-    const suggestions = await deepseekSuggestImageQueries(brief, pageIntent, language, config);
+    const suggestions = await suggestImageQueries(brief, pageIntent, language, config);
     const fallbacks = [
         [brief.businessName, brief.industry].filter(Boolean).join(' '),
         [brief.industry, pageIntent].filter(Boolean).join(' '),
@@ -173,8 +173,8 @@ export async function replacePageImagesWithPexels(html, brief, pageIntent, langu
     }
     return { html: serialized, replacements };
 }
-async function deepseekSuggestImageQueries(brief, pageIntent, language, config) {
-    const apiKey = config.deepseekApiKey.trim();
+async function suggestImageQueries(brief, pageIntent, language, config) {
+    const apiKey = config.openaiApiKey.trim();
     if (!apiKey)
         return [];
     const descriptionLines = [
@@ -192,20 +192,19 @@ async function deepseekSuggestImageQueries(brief, pageIntent, language, config) 
     const userMessage = `${descriptionLines}\n\n請提供 JSON 陣列，例如 ["modern bakery storefront", "artisan bread display"].`;
     try {
         const response = await config.openai.chat.completions.create({
-            model: config.deepseekModel,
+            model: config.openaiModel,
             messages: [
                 { role: 'system', content: systemMessage },
                 { role: 'user', content: userMessage },
             ],
-            temperature: 0.4,
-            max_tokens: 400,
+            max_completion_tokens: 1200,
         });
         const content = response.choices.at(0)?.message?.content?.trim() ?? '';
         const parsed = parseJsonArray(content);
         return parsed.map((item) => item.trim()).filter(Boolean);
     }
     catch (error) {
-        console.error('[worker] deepseek image query suggestion failed', error);
+        console.error('[worker] image query suggestion failed', error);
         return [];
     }
 }

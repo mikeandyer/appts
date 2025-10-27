@@ -3,7 +3,7 @@ import { createPool, Pool as MysqlPool } from 'mysql2/promise';
 import type { RowDataPacket } from 'mysql2/promise';
 import { load } from 'cheerio';
 import type { CheerioAPI, CheerioOptions } from 'cheerio';
-import OpenAI from 'openai/index.mjs';
+import OpenAI from 'openai';
 import { readFile } from 'fs/promises';
 import path from 'path';
 import { normalizeUsePexelsHero, toAiBrief } from './types.js';
@@ -15,9 +15,21 @@ import {
   type HeroImageConfig,
 } from './pexels.js';
 import { parseJsonArray } from './utils.js';
-const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY ?? '').trim();
-const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1').trim();
-const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL ?? 'deepseek-chat').trim();
+const OPENAI_API_KEY = (
+  process.env.OPENAI_API_KEY ??
+  process.env.DEEPSEEK_API_KEY ??
+  ''
+).trim();
+const OPENAI_BASE_URL = (
+  process.env.OPENAI_BASE_URL ??
+  process.env.DEEPSEEK_BASE_URL ??
+  'https://api.openai.com/v1'
+).trim();
+const OPENAI_MODEL = (
+  process.env.OPENAI_MODEL ??
+  process.env.DEEPSEEK_MODEL ??
+  'gpt-4.1-mini'
+).trim();
 const TEMPLATE_EXPORT_PATH = process.env.TEMPLATE_EXPORT_PATH ?? path.resolve(process.cwd(), '../goldihost_pages_export.json');
 const PEXELS_API_KEY = (process.env.PEXELS_API_KEY ?? '').trim();
 const PEXELS_API_BASE_URL = (process.env.PEXELS_API_BASE_URL ?? 'https://api.pexels.com/v1').trim();
@@ -33,8 +45,8 @@ const TEMPLATE_PAGE_HINTS = {
     faq: { title: 'FAQ', slug: 'faq', intent: 'FAQ page' },
     testimonials: { title: 'Testimonials', slug: 'testimonials', intent: 'testimonials page' },
 };
-if (!DEEPSEEK_API_KEY) {
-    console.warn('[worker] DEEPSEEK_API_KEY not set — rewrites will fail until configured.');
+if (!OPENAI_API_KEY) {
+  console.warn('[worker] OPENAI_API_KEY not set — rewrites will fail until configured.');
 }
 if (!PEXELS_API_KEY) {
     console.warn('[worker] PEXELS_API_KEY not set — hero image replacement will be skipped.');
@@ -50,15 +62,15 @@ const mysqlPool: MysqlPool = createPool({
 });
 const DEFAULT_TEMPLATE_SLUG = 'wood';
 const openai = new OpenAI({
-    apiKey: DEEPSEEK_API_KEY || 'missing-key',
-    baseURL: DEEPSEEK_BASE_URL,
+  apiKey: OPENAI_API_KEY || 'missing-key',
+  baseURL: OPENAI_BASE_URL,
 });
 const heroImageConfig: HeroImageConfig = {
-    pexelsApiKey: PEXELS_API_KEY,
-    pexelsApiBaseUrl: PEXELS_API_BASE_URL,
-    deepseekApiKey: DEEPSEEK_API_KEY,
-    deepseekModel: DEEPSEEK_MODEL,
-    openai,
+  pexelsApiKey: PEXELS_API_KEY,
+  pexelsApiBaseUrl: PEXELS_API_BASE_URL,
+  openaiApiKey: OPENAI_API_KEY,
+  openaiModel: OPENAI_MODEL,
+  openai,
 };
 type PendingJob = {
     id: number;
@@ -182,7 +194,13 @@ async function handleJob(job: PendingJob): Promise<void> {
         for (const page of payloadPages) {
             const textNodes = findAllTextNodes(page.html);
             const pageIntent = inferPageIntent(page.slug);
-            const replacements = await deepseekRewrite(textNodes, job.payload?.description ?? '', language, pageIntent);
+            const { rewrites: replacements, tokensUsed, tokensLeft } = await rewriteTextWithOpenAI(
+                textNodes,
+                job.payload?.description ?? '',
+                language,
+                pageIntent,
+            );
+            logTextRewrites(page.slug, textNodes, replacements, tokensUsed, tokensLeft);
             let newHtml = replaceTextNodes(page.html, replacements);
             if (allowPexelsHero &&
                 heroImageConfig.pexelsApiKey &&
@@ -200,7 +218,7 @@ async function handleJob(job: PendingJob): Promise<void> {
             }
             let newTitle = page.title;
             let newSlug = page.slug;
-            const meta = await deepseekRewriteMeta({
+            const meta = await rewriteMetaWithOpenAI({
                 title: page.title,
                 slug: page.slug,
                 description: job.payload?.description ?? '',
@@ -409,13 +427,12 @@ async function localizeTitle(baseTitle: string, language: string, intent: string
 標題：${baseTitle}`;
     try {
         const response = await openai.chat.completions.create({
-            model: DEEPSEEK_MODEL,
+            model: OPENAI_MODEL,
             messages: [
                 { role: 'system', content: '你是一位專業網站翻譯與在地化專家，只需回傳改寫後的標題。' },
                 { role: 'user', content: prompt },
             ],
-            temperature: 0.2,
-            max_tokens: 120,
+            max_completion_tokens: 120,
         });
         const content = response.choices.at(0)?.message?.content?.trim() ?? '';
         if (content) {
@@ -511,11 +528,54 @@ function replaceTextNodes(html: string, replacements: string[]): string {
     const serialized = serializeFragment($);
     return serialized.length > 0 ? serialized : html;
 }
-async function deepseekRewrite(texts: string[], description: string, language: string, intent: string): Promise<string[]> {
+function logTextRewrites(
+    pageSlug: string,
+    originals: string[],
+    rewrites: string[],
+    tokensUsed?: number,
+    tokensLeft?: number,
+): void {
+    if (!originals.length || !rewrites.length)
+        return;
+    const count = Math.min(originals.length, rewrites.length);
+    for (let i = 0; i < count; i += 1) {
+        const original = originals[i] ?? '';
+        const rewrite = rewrites[i] ?? '';
+        const trimmedOriginal = original.length > 200 ? `${original.slice(0, 197)}...` : original;
+        const trimmedRewrite = rewrite.length > 200 ? `${rewrite.slice(0, 197)}...` : rewrite;
+        const status = original === rewrite ? 'unchanged' : 'updated';
+        const payload: Record<string, unknown> = {
+            original: trimmedOriginal,
+            rewrite: trimmedRewrite,
+        };
+        if (typeof tokensUsed === 'number') {
+            payload.tokens_used = tokensUsed;
+        }
+        if (typeof tokensLeft === 'number') {
+            payload.tokens_left = tokensLeft;
+        }
+        console.log(`[worker] text rewrite (${pageSlug}) [${status}]`, payload);
+    }
+}
+type TextRewriteResult = {
+    rewrites: string[];
+    tokensUsed?: number;
+    tokensLeft?: number;
+};
+const configuredMaxCompletionTokens = Number.parseInt(process.env.OPENAI_MAX_COMPLETION_TOKENS ?? '4000', 10);
+const MAX_COMPLETION_TOKENS_TEXT = Number.isFinite(configuredMaxCompletionTokens) && configuredMaxCompletionTokens > 0
+    ? configuredMaxCompletionTokens
+    : 4000;
+async function rewriteTextWithOpenAI(
+    texts: string[],
+    description: string,
+    language: string,
+    intent: string,
+): Promise<TextRewriteResult> {
     if (!texts.length)
-        return texts;
-    if (!DEEPSEEK_API_KEY)
-        return texts;
+        return { rewrites: texts };
+    if (!OPENAI_API_KEY)
+        return { rewrites: texts };
     const languageHint = language ? describeLanguage(language) : '依照 WordPress 語系或原始語言輸出';
     const systemMessage = '你是一位網站文案助理。' +
         '任務：根據使用者提供的 `description` 與 `texts`，為網站改寫更專業且符合情境的字句。' +
@@ -528,28 +588,40 @@ async function deepseekRewrite(texts: string[], description: string, language: s
         `texts：${JSON.stringify(texts)}`;
     try {
         const response = await openai.chat.completions.create({
-            model: DEEPSEEK_MODEL,
+            model: OPENAI_MODEL,
             messages: [
                 { role: 'system', content: systemMessage },
                 { role: 'user', content: userMessage },
             ],
-            temperature: 0.4,
-            max_tokens: 800,
+            max_completion_tokens: MAX_COMPLETION_TOKENS_TEXT,
         });
         const content = response.choices.at(0)?.message?.content?.trim() ?? '';
+        const completionTokens = typeof response.usage?.completion_tokens === 'number' ? response.usage.completion_tokens : undefined;
+        const tokensLeft =
+            typeof completionTokens === 'number'
+                ? Math.max(0, MAX_COMPLETION_TOKENS_TEXT - completionTokens)
+                : undefined;
         const parsed = parseJsonArray(content);
         if (parsed.length === texts.length) {
-            return parsed.map((item) => item.trim());
+            return {
+                rewrites: parsed.map((item) => item.trim()),
+                tokensUsed: completionTokens,
+                tokensLeft,
+            };
         }
         if (parsed.length > 0) {
             const merged = [...parsed.map((item) => item.trim()), ...texts].slice(0, texts.length);
-            return merged;
+            return {
+                rewrites: merged,
+                tokensUsed: completionTokens,
+                tokensLeft,
+            };
         }
     }
     catch (error) {
-        console.error('[worker] deepseek rewrite failed', error);
+        console.error('[worker] text rewrite failed', error);
     }
-    return texts;
+    return { rewrites: texts };
 }
 type MetaRewriteRequest = {
     title: string;
@@ -563,8 +635,8 @@ type MetaRewriteResult = {
     title?: string;
     slug?: string;
 };
-async function deepseekRewriteMeta(request: MetaRewriteRequest, language: string): Promise<MetaRewriteResult> {
-    if (!DEEPSEEK_API_KEY)
+async function rewriteMetaWithOpenAI(request: MetaRewriteRequest, language: string): Promise<MetaRewriteResult> {
+    if (!OPENAI_API_KEY)
         return {};
     const languageHint = language ? describeLanguage(language) : '依照 WordPress 語系或原始語言輸出';
     const systemMessage = '你是一位網站的 SEO 文案助理。' +
@@ -584,13 +656,12 @@ async function deepseekRewriteMeta(request: MetaRewriteRequest, language: string
     const userMessage = JSON.stringify(payload, null, 2);
     try {
         const response = await openai.chat.completions.create({
-            model: DEEPSEEK_MODEL,
+            model: OPENAI_MODEL,
             messages: [
                 { role: 'system', content: systemMessage },
                 { role: 'user', content: userMessage },
             ],
-            temperature: 0.4,
-            max_tokens: 300,
+            max_completion_tokens: 1500,
         });
         const content = response.choices.at(0)?.message?.content?.trim() ?? '';
         const parsed = parseJsonObject(content);
@@ -599,7 +670,7 @@ async function deepseekRewriteMeta(request: MetaRewriteRequest, language: string
         return { title, slug };
     }
     catch (error) {
-        console.error('[worker] deepseek meta rewrite failed', error);
+        console.error('[worker] meta rewrite failed', error);
         return {};
     }
 }

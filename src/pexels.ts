@@ -1,7 +1,7 @@
 import { load } from 'cheerio';
 import type { Cheerio, CheerioAPI } from 'cheerio';
 import type { AnyNode } from 'domhandler';
-import type OpenAI from 'openai/index.mjs';
+import type OpenAI from 'openai';
 import type { AiBrief } from './types.js';
 import { serializeFragment } from './html-utils.js';
 import { parseJsonArray } from './utils.js';
@@ -26,8 +26,8 @@ export type PexelsHeroImage = {
 export interface HeroImageConfig {
   pexelsApiKey: string;
   pexelsApiBaseUrl: string;
-  deepseekApiKey: string;
-  deepseekModel: string;
+  openaiApiKey: string;
+  openaiModel: string;
   openai: OpenAI;
 }
 
@@ -79,7 +79,7 @@ export async function selectHeroImage(
     Boolean(brief.industry && brief.industry.trim()) ||
     Boolean(brief.businessName && brief.businessName.trim());
   if (!hasContext) return null;
-  const suggestions = await deepseekSuggestImageQueries(brief, pageIntent, language, config);
+  const suggestions = await suggestImageQueries(brief, pageIntent, language, config);
   const fallbacks = [
     [brief.businessName, brief.industry].filter(Boolean).join(' '),
     [brief.industry, pageIntent].filter(Boolean).join(' '),
@@ -120,7 +120,7 @@ export async function selectPexelsImageBatch(
     Boolean(brief.industry && brief.industry.trim()) ||
     Boolean(brief.businessName && brief.businessName.trim());
   if (!hasContext) return [];
-  const suggestions = await deepseekSuggestImageQueries(brief, pageIntent, language, config);
+  const suggestions = await suggestImageQueries(brief, pageIntent, language, config);
   const fallbacks = [
     [brief.businessName, brief.industry].filter(Boolean).join(' '),
     [brief.industry, pageIntent].filter(Boolean).join(' '),
@@ -242,13 +242,13 @@ export async function replacePageImagesWithPexels(
   return { html: serialized, replacements };
 }
 
-async function deepseekSuggestImageQueries(
+async function suggestImageQueries(
   brief: AiBrief,
   pageIntent: string,
   language: string,
   config: HeroImageConfig,
 ): Promise<string[]> {
-  const apiKey = config.deepseekApiKey.trim();
+  const apiKey = config.openaiApiKey.trim();
   if (!apiKey) return [];
   const descriptionLines = [
     brief.businessName ? `品牌名稱：${brief.businessName}` : '',
@@ -269,19 +269,18 @@ async function deepseekSuggestImageQueries(
 
   try {
     const response = await config.openai.chat.completions.create({
-      model: config.deepseekModel,
+      model: config.openaiModel,
       messages: [
         { role: 'system', content: systemMessage },
         { role: 'user', content: userMessage },
       ],
-      temperature: 0.4,
-      max_tokens: 400,
+      max_completion_tokens: 1200,
     });
     const content = response.choices.at(0)?.message?.content?.trim() ?? '';
     const parsed = parseJsonArray(content);
     return parsed.map((item) => item.trim()).filter(Boolean);
   } catch (error) {
-    console.error('[worker] deepseek image query suggestion failed', error);
+    console.error('[worker] image query suggestion failed', error);
     return [];
   }
 }
